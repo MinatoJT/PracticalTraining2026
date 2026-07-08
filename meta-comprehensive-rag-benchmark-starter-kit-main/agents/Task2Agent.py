@@ -79,14 +79,15 @@ class Task2Agent(Task1KGAgent):
         responses = []
 
         for query, image, history in zip(queries, images, message_histories):
-            # 1. 复用 Task1：图像检索 KG。
+            # 1. 复用 Task1：图像检索 KG，并使用 Task1 已修复的多候选阈值策略。
             raw_image_results = self._image_search(image)
             kg_evidence = self._build_evidence(raw_image_results)
             ranked_kg = self._rank_candidates_by_rules(query, kg_evidence)
-            selected_entity = self._select_entity(query, ranked_kg)
+            support_entities = self._select_supporting_entities(query, ranked_kg)
+            selected_entity = support_entities[0] if support_entities else (ranked_kg[0] if ranked_kg else None)
 
-            # 2. Task2 新增：基于问题和 KG 实体构造网页检索 query。
-            web_query = self._build_web_query(query, selected_entity, ranked_kg)
+            # 2. Task2 新增：基于问题和多个 KG 候选构造网页检索 query，避免只围绕 top1 跑偏实体搜索。
+            web_query = self._build_web_query(query, selected_entity, support_entities or ranked_kg)
             raw_web_results = self._web_search(web_query)
             web_evidence = self._build_web_evidence(raw_web_results)
 
@@ -96,14 +97,14 @@ class Task2Agent(Task1KGAgent):
                 web_query=web_query,
                 web_evidence=web_evidence,
                 selected_entity=selected_entity,
-                kg_evidence=ranked_kg,
+                kg_evidence=support_entities or ranked_kg,
             )
 
             # 4. Task2 新增：KG-Web 多源融合。
             fused_context = self._fuse_multisource_evidence(
                 query=query,
                 selected_entity=selected_entity,
-                kg_evidence=ranked_kg,
+                kg_evidence=support_entities or ranked_kg,
                 web_evidence=ranked_web,
             )
 
@@ -114,6 +115,7 @@ class Task2Agent(Task1KGAgent):
                 "kg_count": len(kg_evidence),
                 "web_query": web_query,
                 "web_count": len(web_evidence),
+                "support_entities": [item.get("entity_name") for item in support_entities],
                 "ranked_web_titles": [item.get("title") for item in ranked_web[: self.web_keep_top_n]],
                 "has_client": self.client is not None,
             })
@@ -123,14 +125,14 @@ class Task2Agent(Task1KGAgent):
                 answer = self._answer_task2_with_llm(
                     query=query,
                     selected_entity=selected_entity,
-                    kg_candidates=ranked_kg,
+                    kg_candidates=support_entities or ranked_kg,
                     web_evidence=ranked_web,
                     fused_context=fused_context,
                     history=history,
                 )
             else:
                 # 无 DeepSeek key 或 SDK 不可用时，回退到 Task1 的 KG 规则抽取。
-                answer = self._answer_with_rules(query, ranked_kg)
+                answer = self._answer_with_heuristic_sentence(query, support_entities or ranked_kg) or self._answer_with_rules(query, support_entities or ranked_kg)
 
             responses.append(self._finalize_answer(answer))
 
@@ -384,6 +386,8 @@ class Task2Agent(Task1KGAgent):
         fused_context: Dict[str, Any],
         history: List[Dict[str, Any]],
     ) -> str:
+        # Task2 回答接口：把多个 KG 候选和多个 Web 片段一起交给 DeepSeek，
+        # 并复用 Task1 的完整句质量闸门，避免输出 top1 实体名或短语。
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -395,23 +399,28 @@ class Task2Agent(Task1KGAgent):
                     fused_context=fused_context,
                     history=history,
                 ),
-                temperature=0.1,
-                max_tokens=90,
+                temperature=0.0,
+                max_tokens=130,
             )
 
             answer = response.choices[0].message.content or ""
 
-            if selected_entity and self._is_entity_echo(answer, selected_entity):
-                answer = self._repair_entity_echo(query, selected_entity, kg_candidates, history)
+            if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                answer = self._rewrite_task2_as_sentence(query, answer, kg_candidates, web_evidence, history) or answer
 
-            if not answer.strip():
-                answer = self._answer_with_rules(query, kg_candidates)
+            if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                answer = self._answer_with_heuristic_sentence(query, kg_candidates) or answer
+
+            if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                answer = "I don't know."
 
             self._debug_task2({
                 "event": "task2_llm_success",
                 "query": query,
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
-                "answer": answer[:240],
+                "kg_entities": [item.get("entity_name") for item in kg_candidates[: self.rerank_top_n]],
+                "web_titles": [item.get("title") for item in web_evidence[: self.web_keep_top_n]],
+                "answer": answer[:260],
             })
             return answer
 
@@ -421,7 +430,7 @@ class Task2Agent(Task1KGAgent):
                 "query": query,
                 "error": repr(exc),
             })
-            return self._answer_with_rules(query, kg_candidates)
+            return self._answer_with_heuristic_sentence(query, kg_candidates) or self._answer_with_rules(query, kg_candidates)
 
     def _build_task2_answer_messages(
         self,
@@ -432,43 +441,75 @@ class Task2Agent(Task1KGAgent):
         fused_context: Dict[str, Any],
         history: List[Dict[str, Any]],
     ) -> List[Dict[str, str]]:
-        selected_name = selected_entity.get("entity_name", "") if selected_entity else ""
-        selected_attrs = selected_entity.get("attributes", {}) if selected_entity else {}
-
-        selected_attr_text = self._format_attributes(selected_attrs, limit=16)
+        # 中文 Task2 prompt：弱化单个 selected entity，强调多 KG 候选 + Web 证据综合判断。
         kg_text = self._format_kg_candidates(kg_candidates[: self.rerank_top_n])
         web_text = self._format_web_evidence(web_evidence[: self.web_keep_top_n])
         history_text = self._format_history(history)
 
         system = (
-            "You are a visual question answering assistant for a multi-source augmented task. "
-            "You will receive image-KG evidence and web-search evidence. "
-            "Image-KG evidence is directly retrieved from visually similar images and is the primary evidence. "
-            "Web evidence is auxiliary and may contain noise. "
-            "Use web evidence only when it is relevant to the question and consistent with the image-KG evidence. "
-            "Do not invent unsupported facts. "
-            "If the answer cannot be determined from the provided evidence, answer 'I don't know'. "
-            "Answer in the same language as the user's question. "
-            "Keep the answer concise, usually one sentence. "
-            "Do not mention retrieval, evidence, KG, or web search in the final answer."
+            "你是用于 CRAG-MM Task2 多源增强的视觉问答助手。"
+            "系统会提供图像检索得到的多个 Image-KG 候选实体及其属性，以及网页检索得到的标题和片段。"
+            "KG 候选按相关性排序，但 top1 可能错误；你必须根据用户问题、实体类型、属性内容和网页片段综合判断。"
+            "Web 证据用于补充背景知识、验证 KG 实体、补全 KG 中缺失的事实，但可能包含噪声。"
+            "如果 KG 与 Web 冲突，优先相信与图片问题更匹配、且能直接回答问题的证据。"
+            "必须直接回答用户真正问的问题，不能只输出实体名、车型名、建筑名、食物名或逗号分隔短语。"
+            "如果问题问 yes/no，要先回答 Yes 或 No；问数量、时间、来源、原因、用途或安全判断，要给出对应信息。"
+            "用户用英文问就用英文答。最终答案必须是完整自然句，最多两句话。不要提到 KG、检索、候选、网页或推理过程。"
         )
 
         user = (
-            f"User question:\n{query}\n\n"
-            f"Selected image-KG entity:\n{selected_name}\n\n"
-            f"Selected entity attributes:\n{selected_attr_text}\n\n"
-            f"Other image-KG candidates:\n{kg_text}\n\n"
-            f"Filtered web evidence:\n{web_text}\n\n"
-            f"Conversation history, if any:\n{history_text}\n\n"
-            "Evidence-use rules:\n"
-            "1. Prefer selected image-KG entity and its attributes for image-specific facts.\n"
-            "2. Use web evidence only to supplement missing background information or verify the selected entity.\n"
-            "3. Ignore irrelevant or noisy web snippets.\n"
-            "4. If web evidence conflicts with image-KG evidence, prefer image-KG evidence unless it is clearly insufficient.\n"
-            "5. Directly answer the user's question. Do not explain the reasoning process.\n"
+            f"用户问题：\n{query}\n\n"
+            f"Image-KG 候选实体与属性：\n{kg_text}\n\n"
+            f"筛选后的 Web 证据：\n{web_text}\n\n"
+            f"历史上下文：\n{history_text}\n\n"
+            "请综合 KG 与 Web，直接输出最终答案。答案必须是完整英文句子，不能只输出单个实体名或短语。"
         )
 
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def _rewrite_task2_as_sentence(
+        self,
+        query: str,
+        bad_answer: str,
+        kg_candidates: List[Dict[str, Any]],
+        web_evidence: List[Dict[str, Any]],
+        history: List[Dict[str, Any]],
+    ) -> str:
+        # Task2 二次改写接口：当模型仍输出实体名/短语时，强制结合 KG 和 Web 生成完整句。
+        kg_text = self._format_kg_candidates(kg_candidates[: self.rerank_top_n])
+        web_text = self._format_web_evidence(web_evidence[: self.web_keep_top_n])
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是答案改写器。上一版答案不合格，可能只是实体名、短语或空串。"
+                            "现在必须用英文完整句直接回答用户问题。"
+                            "可以使用 KG 候选和 Web 片段；如果证据不足，输出完整句 I don't know."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"用户问题：{query}\n"
+                            f"不合格答案：{bad_answer}\n"
+                            f"KG 候选：\n{kg_text}\n"
+                            f"Web 证据：\n{web_text}\n"
+                            "请输出一个完整英文句子，最多两句话。"
+                        ),
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=130,
+            )
+            rewritten = response.choices[0].message.content or ""
+            self._debug_task2({"event": "task2_sentence_rewrite", "query": query, "bad_answer": bad_answer[:160], "rewritten": rewritten[:220]})
+            return rewritten
+        except Exception as exc:
+            self._debug_task2({"event": "task2_sentence_rewrite_error", "query": query, "error": repr(exc)})
+            return ""
 
     # ---------------------------------------------------------------------
     # Formatting / Utility

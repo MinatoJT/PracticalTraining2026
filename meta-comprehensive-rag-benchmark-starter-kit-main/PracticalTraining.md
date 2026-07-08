@@ -135,3 +135,16 @@ UI 已新增 `deepseek-v4-flash - semantic judge` 选项。选择该选项后，
 - `UI/run_eval.py` 已调整为：Task1 仍使用 MiniLM 占位；Task2/Task3 启用 web search 时使用 `BAAI/bge-large-en-v1.5`。
 
 验证结果：运行 `UI/run_eval.py --task task2 --agent task2agent --num-conversations 1 --eval-model None --no-progress` 已完成，无 Chroma traceback；`UI/outputs/task2/debug.jsonl` 中 `web_count=8`，说明网页检索已返回结果。
+
+
+## Task2 中文 Prompt 与完整句修复
+
+针对 Task2 跑通后回答仍经常退化为单个实体名或 top1 短语的问题，`agents/Task2Agent.py` 做了如下调整：
+
+- 主流程不再只依赖 `_select_entity()` 的单一 top1 实体，而是复用 Task1 的 `_select_supporting_entities()`，把多个高置信 Image-KG 候选传入回答阶段。
+- Web query 由“问题 + 单个实体”改为“问题 + 多 KG 候选上下文”，减少 top1 跑偏时网页检索继续跑偏。
+- `_build_task2_answer_messages()` 改为中文 prompt，明确要求综合 Image-KG 候选和 Web evidence，且必须输出完整英文句，不能只输出实体名、车型名、建筑名、食物名或逗号短语。
+- `_answer_task2_with_llm()` 复用 Task1 的完整句质量闸门：不合格回答会触发 Task2 专用二次改写 `_rewrite_task2_as_sentence()`。
+- DeepSeek 仍输出空串或短语时，回退到 Task1 的 `_answer_with_heuristic_sentence()`，至少给出完整句兜底，避免 hallucination 表格里全是单词。
+
+验证：无 API smoke test 跑通 `--task task2 --agent task2agent --num-conversations 1`，web search 返回 `web_count=8`，输出从 `Honda Civic` 变为完整句：`No, this car is not suitable for transporting seven passengers at once because it seats about five people.`
