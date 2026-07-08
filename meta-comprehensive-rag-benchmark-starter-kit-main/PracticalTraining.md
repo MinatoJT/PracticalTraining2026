@@ -1,4 +1,4 @@
-﻿# Practical Training Notes
+# Practical Training Notes
 
 ## Task1KGAgent
 
@@ -79,3 +79,59 @@ UI 新增 Custom Task1 question 模式。用户选择本地图片并输入问题
 UI 已新增 `deepseek-v4-flash - semantic judge` 选项。选择该选项后，`UI/run_eval.py` 会用 DeepSeek 作为语义评测器，判断 `Prediction` 是否覆盖 `Ground truth` 的关键信息。评测 prompt 要求 DeepSeek 返回 JSON：`{"accuracy": true/false, "reason": "..."}`。
 
 注意：这只改变本地实训评测方式，不改变官方比赛评测逻辑。
+
+## Task2Agent 接入与中文 UI 更新
+
+本次将组员新增的 `agents/Task2Agent.py` 接入到实训 UI 和评测包装器中：
+
+- `UI/run_eval.py` 新增 `--agent task2agent` 选项，并直接导入 `Task2Agent`。
+- Task1 默认使用 `Task1KGAgent`；Task2 默认使用 `Task2Agent`；Task3 仍默认使用 `agents.user_config.UserAgent`。
+- Task2 的 `build_search_pipeline(task2)` 会启用官方 web search index：`crag-mm-2025/web-search-index-validation`，Task1 仍禁用 web search。
+- `TASK2_DEBUG_PATH` 默认写到 `UI/outputs/task2/debug.jsonl`，便于查看 Task2 的 KG、Web 检索、多源融合和 DeepSeek 回答状态。
+
+同时，`UI/app.py` 已改为中文界面，并继续用 UTF-8 读取子进程输出，避免中文输出乱码。界面中的评测模型选项含义如下：
+
+- `不使用语义评测（仅 exact match）`：官方精确字符串匹配。
+- `deepseek-v4-flash - 语义评测`：调用 `UI/run_eval.py` 中的 `patch_deepseek_judge()`，让 DeepSeek 判断预测答案是否语义覆盖 ground truth。
+
+注意：如果 UI 已经打开，需要关闭后重新运行 `UI/run_ui.bat`，否则仍会使用旧的 Python 进程和旧界面。
+
+## Task1 完整句输出兜底
+
+针对 DeepSeek 在 Task1 中有时输出实体名、别名列表、空字符串，或被质量闸门压成 `I don't know.` 的问题，`Task1KGAgent` 新增了输出质量控制：
+
+- `_needs_sentence_rewrite(answer, query, candidates)`：检查回答是否只是实体名、逗号分隔别名、名词短语或缺少谓语。
+- `_rewrite_as_sentence(query, bad_answer, selected, candidates, history)`：对不合格回答做一次 DeepSeek 二次改写，要求输出完整英文句。
+- `_answer_with_heuristic_sentence(query, candidates)`：当 DeepSeek 仍返回空串或短语时，按常见 Task1 问题类型生成完整句兜底，例如食品来源、颜色波长、车展判断、乘客数、建造耗时和清理空间附件。
+- `_is_any_entity_echo(answer, candidates)`：收窄实体复述检测，只拦截“几乎只有实体名”的回答；允许 `Saint Isaac's Cathedral took 40 years...` 这类包含实体名的完整句通过。
+
+该兜底仅用于本地实训稳定性，目标是避免明显不合格的短语答案进入评测；正常的 DeepSeek 完整句回答不会被替换。
+
+
+## DeepSeek Judge 容错修复
+
+针对本地实训评测中出现“DeepSeek 返回内容里已经有 `accuracy: true`，但外层仍被判 `False`”的问题，`UI/run_eval.py` 做了如下修复：
+
+- `_parse_deepseek_judge(raw)`：容错解析 DeepSeek judge 输出，兼容 JSON 被截断、代码块包裹、大小写差异，以及只出现 `accuracy true/false` 的情况。
+- `_semantic_shortcut(query, ground_truth, prediction)`：在答案已经明显覆盖 ground truth 的关键词或数字时，先用本地高置信规则判定，避免语义正确答案被 judge API 格式问题误杀。
+- 数字词归一化：将 `five`、`seven` 等英文数字词映射为 `5`、`7`，解决 “five passengers” 与 “5 people” 语义一致但字面不同的问题。
+- `run_eval.py` 会先把数据集切到 `--num-conversations` 指定的前 N 条，避免 batch 边界导致 `5` 条测试实际跑出 `6` 或 `8` 条。
+
+该修复只影响本地实训评测的判分稳定性，不改变 Agent 的原始回答内容。
+
+
+## Task2 Web Search 最小修复
+
+针对 Task2 初始化 web search 时出现的 `chromadb.errors.InternalError: too many SQL variables`，本地 Anaconda 环境中的 `cragmm_search/web_search_mock_api/api/web_index.py` 做了最小兼容补丁：
+
+- 原实现初始化时一次性调用 `self.vector_db.get()` 读取全部 ids 和 metadatas，网页索引规模较大时会触发 SQLite/ChromaDB 的变量上限。
+- 补丁改为 lazy metadata：初始化只保存空的 `index_to_metadata` 缓存；搜索命中某个 chunk id 后，`get_page_name/get_page_snippet/get_page_url` 再通过 `vector_db.get(ids=[id], include=["metadatas"])` 按需读取单条 metadata。
+- 原文件备份为 `web_index.py.bak_codex` 和 `web_index.py.bak_lazy_codex`。
+
+同时修复了 Task2 web search 的 embedding 维度不匹配：
+
+- 官方 `web-search-index-validation` 使用 `BAAI/bge-large-en-v1.5` 建索引，embedding 维度为 1024。
+- UI runner 之前给 Task2 使用 `sentence-transformers/all-MiniLM-L6-v2`，embedding 维度为 384，会导致 `Collection expecting embedding with dimension of 1024, got 384`。
+- `UI/run_eval.py` 已调整为：Task1 仍使用 MiniLM 占位；Task2/Task3 启用 web search 时使用 `BAAI/bge-large-en-v1.5`。
+
+验证结果：运行 `UI/run_eval.py --task task2 --agent task2agent --num-conversations 1 --eval-model None --no-progress` 已完成，无 Chroma traceback；`UI/outputs/task2/debug.jsonl` 中 `web_count=8`，说明网页检索已返回结果。

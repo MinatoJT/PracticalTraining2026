@@ -1,4 +1,4 @@
-﻿import os
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +38,7 @@ class EvalWorker(QThread):
         self.process = None
 
     def run(self):
-        self.output.emit("Running: " + " ".join(self.command) + "\n")
+        self.output.emit("运行命令: " + " ".join(self.command) + "\n")
         self.process = subprocess.Popen(
             self.command,
             cwd=str(ROOT_DIR),
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
-        self.setWindowTitle("CRAG-MM Practical Training UI")
+        self.setWindowTitle("CRAG-MM 智能实训工具")
         self.resize(980, 760)
         self._build_ui()
         self._sync_task_defaults()
@@ -72,82 +72,83 @@ class MainWindow(QMainWindow):
         root = QWidget()
         layout = QVBoxLayout(root)
 
-        header = QLabel("CRAG-MM Task Runner")
+        header = QLabel("CRAG-MM 任务运行器")
         header.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(header)
 
-        form_box = QGroupBox("Run Settings")
+        form_box = QGroupBox("运行设置")
         form = QFormLayout(form_box)
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Dataset evaluation", "eval")
-        self.mode_combo.addItem("Custom Task1 question", "custom")
+        self.mode_combo.addItem("数据集评测", "eval")
+        self.mode_combo.addItem("自定义 Task1 问答", "custom")
         self.mode_combo.currentIndexChanged.connect(self._sync_mode)
-        form.addRow("Mode", self.mode_combo)
+        form.addRow("运行模式", self.mode_combo)
 
         self.task_combo = QComboBox()
-        self.task_combo.addItem("Task 1 - Single-source Augmentation", "task1")
-        self.task_combo.addItem("Task 2 - Multi-source Augmentation", "task2")
-        self.task_combo.addItem("Task 3 - Multi-turn QA", "task3")
+        self.task_combo.addItem("Task 1 - 单源增强", "task1")
+        self.task_combo.addItem("Task 2 - 多源增强", "task2")
+        self.task_combo.addItem("Task 3 - 多轮问答", "task3")
         self.task_combo.currentIndexChanged.connect(self._sync_task_defaults)
-        form.addRow("Task", self.task_combo)
+        form.addRow("任务", self.task_combo)
 
         self.agent_combo = QComboBox()
-        self.agent_combo.addItem("Task1KGAgent", "task1kg")
-        self.agent_combo.addItem("Project user_config.UserAgent", "user_config")
-        form.addRow("Agent", self.agent_combo)
+        self.agent_combo.addItem("Task1KGAgent（Task1 知识图谱）", "task1kg")
+        self.agent_combo.addItem("Task2Agent（Task2 多源增强）", "task2agent")
+        self.agent_combo.addItem("项目 user_config.UserAgent", "user_config")
+        form.addRow("智能体", self.agent_combo)
 
         self.num_spin = QSpinBox()
         self.num_spin.setRange(1, 5000)
         self.num_spin.setValue(20)
-        form.addRow("Conversations", self.num_spin)
+        form.addRow("评测样本数", self.num_spin)
 
         self.display_spin = QSpinBox()
         self.display_spin.setRange(0, 50)
         self.display_spin.setValue(5)
-        form.addRow("Display examples", self.display_spin)
+        form.addRow("展示样例数", self.display_spin)
 
         self.eval_combo = QComboBox()
-        self.eval_combo.addItem("None - exact match only", "None")
-        self.eval_combo.addItem("gpt-4o-mini - semantic judge", "gpt-4o-mini")
-        self.eval_combo.addItem("deepseek-v4-flash - semantic judge", "deepseek-v4-flash")
-        form.addRow("Eval model", self.eval_combo)
+        self.eval_combo.addItem("不使用语义评测（仅 exact match）", "None")
+        self.eval_combo.addItem("gpt-4o-mini - 语义评测", "gpt-4o-mini")
+        self.eval_combo.addItem("deepseek-v4-flash - 语义评测", "deepseek-v4-flash")
+        form.addRow("评测模型", self.eval_combo)
 
         self.image_edit = QLineEdit()
-        self.image_edit.setPlaceholderText("Choose an image for custom Task1 question")
-        self.browse_button = QPushButton("Browse")
+        self.image_edit.setPlaceholderText("选择一张图片用于自定义 Task1 问答")
+        self.browse_button = QPushButton("选择图片")
         self.browse_button.clicked.connect(self._browse_image)
         image_row = QHBoxLayout()
         image_row.addWidget(self.image_edit, 1)
         image_row.addWidget(self.browse_button)
-        form.addRow("Custom image", image_row)
+        form.addRow("自定义图片", image_row)
 
         self.question_edit = QLineEdit()
-        self.question_edit.setPlaceholderText("Example: What is this building called?")
-        form.addRow("Custom question", self.question_edit)
+        self.question_edit.setPlaceholderText("示例：What is this building called?")
+        form.addRow("自定义问题", self.question_edit)
 
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.Password)
         self.api_key_edit.setText(os.environ.get("DEEPSEEK_API_KEY", ""))
-        self.api_key_edit.setPlaceholderText("Optional for Task1KGAgent; set if using DeepSeek generation")
-        form.addRow("DeepSeek API key", self.api_key_edit)
+        self.api_key_edit.setPlaceholderText("使用 DeepSeek 生成或语义评测时填写")
+        form.addRow("DeepSeek API Key", self.api_key_edit)
 
         self.model_edit = QLineEdit(os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"))
-        form.addRow("DeepSeek model", self.model_edit)
+        form.addRow("DeepSeek 模型", self.model_edit)
 
         self.revision_edit = QLineEdit("v0.1.2")
-        form.addRow("Dataset revision", self.revision_edit)
+        form.addRow("数据集版本", self.revision_edit)
 
-        self.no_progress_check = QCheckBox("Disable progress bars")
+        self.no_progress_check = QCheckBox("禁用进度条")
         self.no_progress_check.setChecked(False)
-        form.addRow("Options", self.no_progress_check)
+        form.addRow("选项", self.no_progress_check)
 
         layout.addWidget(form_box)
 
         buttons = QHBoxLayout()
-        self.run_button = QPushButton("Run")
+        self.run_button = QPushButton("运行")
         self.run_button.clicked.connect(self._run_eval)
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton("停止")
         self.stop_button.clicked.connect(self._stop_eval)
         self.stop_button.setEnabled(False)
         buttons.addWidget(self.run_button)
@@ -158,13 +159,13 @@ class MainWindow(QMainWindow):
         self.command_preview = QPlainTextEdit()
         self.command_preview.setReadOnly(True)
         self.command_preview.setMaximumHeight(94)
-        layout.addWidget(QLabel("Command preview"))
+        layout.addWidget(QLabel("命令预览"))
         layout.addWidget(self.command_preview)
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
-        layout.addWidget(QLabel("Output"))
+        layout.addWidget(QLabel("输出"))
         layout.addWidget(self.output, 1)
 
         self.setCentralWidget(root)
@@ -195,9 +196,9 @@ class MainWindow(QMainWindow):
     def _browse_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Choose image",
+            "选择图片",
             str(ROOT_DIR),
-            "Images (*.png *.jpg *.jpeg *.bmp *.webp);;All files (*.*)",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*.*)",
         )
         if path:
             self.image_edit.setText(path)
@@ -223,8 +224,10 @@ class MainWindow(QMainWindow):
         task = self.task_combo.currentData()
         if task == "task1":
             self.agent_combo.setCurrentIndex(0)
-        else:
+        elif task == "task2":
             self.agent_combo.setCurrentIndex(1)
+        else:
+            self.agent_combo.setCurrentIndex(2)
         self._update_command_preview()
 
     def _build_command(self):
@@ -281,6 +284,7 @@ class MainWindow(QMainWindow):
         env["CRAG_CACHE_DIR"] = str(dataset_dir / "crag_images")
         env["CRAG_WEBSEARCH_CACHE_DIR"] = str(dataset_dir / "crag_web_search")
         env["TASK1_DEBUG_PATH"] = str(ROOT_DIR / "UI" / "outputs" / "task1" / "debug.jsonl")
+        env["TASK2_DEBUG_PATH"] = str(ROOT_DIR / "UI" / "outputs" / "task2" / "debug.jsonl")
         return env
 
     def _update_command_preview(self):
@@ -289,7 +293,7 @@ class MainWindow(QMainWindow):
     def _run_eval(self):
         if self.mode_combo.currentData() == "custom":
             if not self.image_edit.text().strip() or not self.question_edit.text().strip():
-                self.output.setPlainText("Custom Task1 mode needs both an image and a question.\n")
+                self.output.setPlainText("自定义 Task1 模式需要同时选择图片并填写问题。\n")
                 return
         self.output.clear()
         self.run_button.setEnabled(False)
@@ -304,7 +308,7 @@ class MainWindow(QMainWindow):
             self.worker.stop()
 
     def _finished(self, code):
-        self.output.insertPlainText(f"\nProcess finished with exit code {code}.\n")
+        self.output.insertPlainText(f"\n进程结束，退出码 {code}。\n")
         self.run_button.setEnabled(True)
         self.stop_button.setEnabled(False)
 
@@ -314,8 +318,3 @@ if __name__ == "__main__":
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
-
-
-
-
