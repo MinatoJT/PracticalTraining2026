@@ -148,3 +148,92 @@ UI 已新增 `deepseek-v4-flash - semantic judge` 选项。选择该选项后，
 - DeepSeek 仍输出空串或短语时，回退到 Task1 的 `_answer_with_heuristic_sentence()`，至少给出完整句兜底，避免 hallucination 表格里全是单词。
 
 验证：无 API smoke test 跑通 `--task task2 --agent task2agent --num-conversations 1`，web search 返回 `web_count=8`，输出从 `Honda Civic` 变为完整句：`No, this car is not suitable for transporting seven passengers at once because it seats about five people.`
+## Windows UI 与环境配置更新
+
+- 新增 `WinUI3/`：这是独立的 Windows 原生 WinUI 3 前端，用于运行 Task1、Task2、Task3 数据集评测和 Task1 自定义问答，不替换原 Qt UI。
+- `WinUI3/run_winui3.bat` 使用 bat 所在目录定位项目，不依赖固定盘符；WinUI 内部会优先使用 `CRAGMM_PYTHON`，其次使用项目 `.venv`，再尝试系统 `python` 或 `py -3`。
+- `UI/run_ui.bat` 已取消 `C:\anaconda\python.exe` 固定路径，改为同样的自动 Python 选择逻辑。
+- `UI/app.py` 默认 Python 从 `sys.executable` 继承，因此直接运行 Qt UI 时也不会绑定某台电脑的 Anaconda 路径。
+- `requirements.txt` 补充了 PySide6、hf_xet、python-dotenv、numpy 上限等依赖，方便新电脑按统一命令配置 Python 环境。
+
+推荐新电脑配置流程：
+
+```bat
+cd meta-comprehensive-rag-benchmark-starter-kit-main
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -U pip
+.venv\Scripts\pip install -r requirements.txt
+UI\run_ui.bat
+```
+
+WinUI 3 版本还需要安装 .NET 8 SDK，然后运行：
+
+```bat
+WinUI3\run_winui3.bat
+```
+
+
+WinUI 3 构建提示：如果缺少 `Microsoft.Build.Packaging.Pri.Tasks.dll`，需要安装 Visual Studio/Build Tools 的 Windows 应用开发和 Windows App SDK 构建组件。
+
+### WinUI 3 依赖安装验证
+
+- 已通过 Visual Studio Installer 为本机 BuildTools 补齐 `Microsoft.VisualStudio.ComponentGroup.UWP.BuildTools` 及 Windows SDK 组件。
+- 安装前 C 盘空间不足，已使用 `pip cache purge` 清理 pip 下载缓存约 15GB。
+- `dotnet build` 会从 .NET SDK 自身路径查找 PRI Tasks，仍可能失败；WinUI3 启动脚本已改为使用 Visual Studio BuildTools 的 `MSBuild.exe`。
+- 验证命令：`MSBuild.exe WinUI3\CRAGMM.WinUI.csproj /restore /p:Configuration=Release /p:Platform=x64`，结果为 0 warning / 0 error。
+
+### WinUI 3 启动失败修复
+
+- 现象：系统已安装 Windows App Runtime 1.6，但 `CRAGMM.WinUI.exe` 仍提示需要 Windows App Runtime。
+- 原因：管理员 PowerShell 能看到 `Microsoft.WindowsAppRuntime.1.6`，普通启动上下文未必能看到同一组用户级 MSIX runtime 包。
+- 修复：WinUI3 项目已启用 `WindowsAppSDKSelfContained=true`，改为自带 Windows App SDK 运行时文件，降低对系统 App Runtime 注册状态的依赖。
+
+### WinUI 3 窗口无法唤起排查
+
+- Windows 事件日志显示进程启动后在 `Microsoft.UI.Xaml.dll` 处崩溃，异常码 `0xc000027b`。
+- 为降低 XAML 资源和编码因素影响，已将 `MainWindow.xaml` 改为 ASCII 文案和普通颜色，并保留全部控件名称与逻辑绑定。
+- 新增 `cragmm_winui_startup.log`，用于记录 `OnLaunched`、窗口构造和激活阶段。
+
+### WinUI 3 资源缺失修复
+
+- 启动日志显示 `XamlParseException: Cannot find a Resource with the Name/Key TabViewButtonBackground`。
+- 原因是 `App.xaml` 未合并 WinUI 控件默认资源。
+- 已在 `App.xaml` 中加入 `<controls:XamlControlsResources />`。
+
+
+## Task3Agent 上下文优化
+
+新增 `agents/Task3Agent.py`，用于 Task3 多轮问答场景。该 Agent 不改变项目骨架，直接继承 `Task2Agent` 的 Image-KG、Web search、KG-Web 融合和完整句兜底能力；新增的核心逻辑是上下文优化：
+
+- `batch_generate_response(queries, images, message_histories)`：官方评测入口。每轮先读取 `message_histories`，再将当前问题改写成可独立检索的问题，随后复用 KG/Web 检索并生成上下文一致的回答。
+- `_build_context_state(history)`：压缩最近若干轮对话，提取上一轮用户问题、上一轮助手回答和近期实体，避免直接把过长历史塞进检索 query。
+- `_rewrite_query_with_context(query, context)`：当前轮若包含 `it/this/that/they` 等追问指代，优先调用 DeepSeek 改写为独立问题；无 API 或调用失败时使用规则兜底拼接上一轮上下文。
+- `_build_task3_web_query(contextual_query, context, selected_entity, kg_evidence)`：在 Task2 网页检索 query 基础上补入历史实体，提高多轮指代问题的网页召回。
+- `_answer_task3_with_llm(...)` / `_build_task3_answer_messages(...)`：使用中文 Prompt 约束 DeepSeek 保持历史一致性，避免与前文冲突；用户英文提问时输出英文完整句，最多两句话。
+- `_rewrite_task3_as_sentence(...)`：当模型仍输出实体名、标题或短语时，二次改写成完整自然句。
+- `TASK3_DEBUG_PATH`：Task3 调试日志路径，默认写入 `UI/outputs/task3/debug.jsonl`，记录上下文改写、检索和回答状态，不记录 API key。
+
+`UI/run_eval.py` 已新增 `--agent task3agent`；Qt UI 与 WinUI3 UI 的 Agent 下拉框均已加入 `Task3Agent`，选择 Task3 时默认使用该 Agent。
+
+### Task2/Task3 日志诊断与检索修复
+
+根据 `UI/outputs/task2/debug.jsonl` 与 `UI/outputs/task3/debug.jsonl` 的实际结果，完成以下修复：
+
+- Task2 `_merge_web_results(...)`：同时执行不带实体的宽查询和带 KG 实体的精确查询，合并并去重结果，避免错误 top1 持续污染 Web 检索。
+- Task2 `_rerank_kg_with_web(...)`：使用网页标题和片段反向给 KG 候选加分；随后调用已有 `_select_entity(...)`，不再直接把规则 top1 当成最终实体。
+- Task2 `_needs_sentence_rewrite(...)`：使用通用完整句检查替换固定动词白名单，避免 `belongs/contains/provides` 等正常谓语被误判并覆盖成 IDK；同时拦截 `It took 40` 这类缺少单位的片段。
+- Task3 `_build_context_state(...)`：从检索上下文中排除 `I don't know`，并区分用户历史与旧 assistant 答案，防止错误答案在后续轮累积传播。
+- Task3 `_should_use_image(...)`：首轮或明确重新指向图片时才做图像检索；普通后续轮使用会话实体和 Web，避免同一图片每轮重新排序后实体漂移。
+- Task3 `_rerank_kg_with_context(...)`：根据当前问题与用户历史给 KG 候选加分，并为动物、植物、船只、茶品等 Task3 常见视觉主体补充类别约束。
+- Task3 `_answer_addresses_current_question(...)`：检测机械重复上一轮答案和缺少数值的回答，触发上下文改写，不再让身份答案覆盖人物、地点、数量等追问。
+
+### Qt 实时测试对话面板
+
+为便于观察 Agent 实际输入输出，Qt 前端新增“实时测试对话”区域：
+
+- `UI/run_eval.py::install_live_event_stream(agent, task)`：在不修改 Agent 接口的前提下包装 `batch_generate_response()`，每轮完成后立即输出一条 JSON 事件。
+- JSON 事件包含 `conversation_id`、`turn`、`query`、`response`、`history` 和 `image_path`；同一 Task3 会话通过图片摘要稳定分组。
+- 评测图片会生成轻量缩略图，保存到 `UI/outputs/live/<run_id>/`；同一多轮会话只保存一次。
+- `UI/app.py::EvalWorker.live_event`：从子进程标准输出中识别实时事件，普通日志仍进入原控制台。
+- `UI/app.py::ConversationView`：按会话 Tab 展示图片、Query 气泡和 Agent Response 气泡；Task3 后续轮持续追加到同一个 Tab。
+- 每次点击运行会清空前端旧会话页，但不会删除磁盘中的历史评测结果或缩略图。

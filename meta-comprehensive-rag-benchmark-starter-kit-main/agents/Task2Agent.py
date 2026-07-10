@@ -83,15 +83,26 @@ class Task2Agent(Task1KGAgent):
             raw_image_results = self._image_search(image)
             kg_evidence = self._build_evidence(raw_image_results)
             ranked_kg = self._rank_candidates_by_rules(query, kg_evidence)
-            support_entities = self._select_supporting_entities(query, ranked_kg)
-            selected_entity = support_entities[0] if support_entities else (ranked_kg[0] if ranked_kg else None)
+            initial_support = self._select_supporting_entities(query, ranked_kg)
+            initial_entity = initial_support[0] if initial_support else (ranked_kg[0] if ranked_kg else None)
 
-            # 2. Task2 新增：基于问题和多个 KG 候选构造网页检索 query，避免只围绕 top1 跑偏实体搜索。
-            web_query = self._build_web_query(query, selected_entity, support_entities or ranked_kg)
-            raw_web_results = self._web_search(web_query)
+            # 2. 同时执行宽查询和实体查询。宽查询负责在 KG top1 错误时召回正确网页，
+            # 实体查询负责补齐图片主体的具体属性；合并后再统一过滤。
+            broad_query = self._clean_query_text(query)
+            web_query = self._build_web_query(query, initial_entity, initial_support or ranked_kg)
+            raw_web_results = self._merge_web_results(
+                self._web_search(broad_query),
+                self._web_search(web_query) if web_query.lower() != broad_query.lower() else [],
+            )
             web_evidence = self._build_web_evidence(raw_web_results)
 
-            # 3. Task2 新增：网页证据过滤、排序、保留 top N。
+            # 3. 让网页标题和片段反向给 KG 候选投票，再调用已有的 LLM 实体选择接口。
+            # 这样不会再把规则 top1 直接当成最终图片实体。
+            ranked_kg = self._rerank_kg_with_web(ranked_kg, web_evidence)
+            support_entities = self._select_supporting_entities(query, ranked_kg)
+            selected_entity = self._select_entity(query, support_entities or ranked_kg)
+
+            # 4. Task2 新增：网页证据过滤、排序、保留 top N。
             ranked_web = self._rank_web_evidence(
                 query=query,
                 web_query=web_query,
@@ -100,7 +111,7 @@ class Task2Agent(Task1KGAgent):
                 kg_evidence=support_entities or ranked_kg,
             )
 
-            # 4. Task2 新增：KG-Web 多源融合。
+            # 5. Task2 新增：KG-Web 多源融合。
             fused_context = self._fuse_multisource_evidence(
                 query=query,
                 selected_entity=selected_entity,
@@ -114,13 +125,14 @@ class Task2Agent(Task1KGAgent):
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
                 "kg_count": len(kg_evidence),
                 "web_query": web_query,
+                "broad_query": broad_query,
                 "web_count": len(web_evidence),
                 "support_entities": [item.get("entity_name") for item in support_entities],
                 "ranked_web_titles": [item.get("title") for item in ranked_web[: self.web_keep_top_n]],
                 "has_client": self.client is not None,
             })
 
-            # 5. 多源回答。
+            # 6. 多源回答。
             if self.client is not None:
                 answer = self._answer_task2_with_llm(
                     query=query,
@@ -191,6 +203,27 @@ class Task2Agent(Task1KGAgent):
 
         return results or []
 
+    def _merge_web_results(self, *result_groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并多次 Web 检索结果，并按 URL/标题去重。"""
+        merged = []
+        seen = set()
+        for group in result_groups:
+            for item in group or []:
+                key = str(
+                    item.get("page_url")
+                    or item.get("url")
+                    or item.get("page_name")
+                    or item.get("title")
+                    or ""
+                ).strip().lower()
+                if not key:
+                    key = repr(item)[:240]
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+        return merged
+
     def _build_web_evidence(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         将网页检索原始结果整理成统一格式。
@@ -242,10 +275,36 @@ class Task2Agent(Task1KGAgent):
                 "score": round(raw_score, 4),
                 "title": title,
                 "url": url,
-                "snippet": snippet[:1200],
+                "snippet": snippet[:700],
             })
 
         return evidence
+
+    def _rerank_kg_with_web(
+        self,
+        ranked_kg: List[Dict[str, Any]],
+        web_evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """使用 Web 标题/片段对 KG 候选做轻量反向投票，但保留原图像分作为基础。"""
+        web_text = " ".join(
+            f"{item.get('title', '')} {item.get('snippet', '')}"
+            for item in web_evidence
+        ).lower()
+        web_tokens = self._important_tokens(web_text)
+        reranked = []
+        for item in ranked_kg:
+            candidate = dict(item)
+            name = str(candidate.get("entity_name", "")).strip().lower()
+            name_tokens = self._important_tokens(name)
+            bonus = 0.0
+            if len(name) >= 4 and name in web_text:
+                bonus += 0.28
+            if name_tokens:
+                bonus += min(0.16, 0.04 * len(name_tokens & web_tokens))
+            candidate["web_support_score"] = round(bonus, 4)
+            candidate["rule_score"] = round(float(candidate.get("rule_score", 0.0) or 0.0) + bonus, 4)
+            reranked.append(candidate)
+        return sorted(reranked, key=lambda item: item.get("rule_score", 0.0), reverse=True)
 
     # ---------------------------------------------------------------------
     # Web Filtering / Ranking
@@ -404,6 +463,7 @@ class Task2Agent(Task1KGAgent):
             )
 
             answer = response.choices[0].message.content or ""
+            raw_answer = answer
 
             if self._needs_sentence_rewrite(answer, query, kg_candidates):
                 answer = self._rewrite_task2_as_sentence(query, answer, kg_candidates, web_evidence, history) or answer
@@ -420,6 +480,7 @@ class Task2Agent(Task1KGAgent):
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
                 "kg_entities": [item.get("entity_name") for item in kg_candidates[: self.rerank_top_n]],
                 "web_titles": [item.get("title") for item in web_evidence[: self.web_keep_top_n]],
+                "raw_answer": raw_answer[:260],
                 "answer": answer[:260],
             })
             return answer
@@ -451,7 +512,8 @@ class Task2Agent(Task1KGAgent):
             "系统会提供图像检索得到的多个 Image-KG 候选实体及其属性，以及网页检索得到的标题和片段。"
             "KG 候选按相关性排序，但 top1 可能错误；你必须根据用户问题、实体类型、属性内容和网页片段综合判断。"
             "Web 证据用于补充背景知识、验证 KG 实体、补全 KG 中缺失的事实，但可能包含噪声。"
-            "如果 KG 与 Web 冲突，优先相信与图片问题更匹配、且能直接回答问题的证据。"
+            "KG 的 top1 可能识别错误；如果多个相关网页能直接回答问题，或网页标题反复指向同一对象，允许 Web 证据纠正 KG。"
+            "不要仅因为 KG 与 Web 不一致就回答不知道；只有 KG 和 Web 都没有相关事实时才回答 I don't know。"
             "必须直接回答用户真正问的问题，不能只输出实体名、车型名、建筑名、食物名或逗号分隔短语。"
             "如果问题问 yes/no，要先回答 Yes 或 No；问数量、时间、来源、原因、用途或安全判断，要给出对应信息。"
             "用户用英文问就用英文答。最终答案必须是完整自然句，最多两句话。不要提到 KG、检索、候选、网页或推理过程。"
@@ -466,6 +528,40 @@ class Task2Agent(Task1KGAgent):
         )
 
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def _needs_sentence_rewrite(
+        self,
+        answer: str,
+        query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> bool:
+        """Task2/Task3 共用的答案闸门：识别片段，但不再依赖固定动词白名单。"""
+        text = re.sub(r"\s+", " ", str(answer or "")).strip()
+        if not text:
+            return True
+        if "i don't know" in text.lower() or "i don’t know" in text.lower():
+            return False
+        if self._is_any_entity_echo(text, candidates):
+            return True
+
+        words = re.findall(r"[A-Za-z0-9']+", text)
+        if len(words) <= 2:
+            return True
+
+        query_l = str(query or "").lower()
+        # 数量/时长问题不能以裸数字结束，例如旧结果中的 “It took 40”。
+        if any(term in query_l for term in ["how long", "how many", "how much"]):
+            if re.search(r"\b\d+(?:\.\d+)?\s*[.!]?$", text) and not re.search(
+                r"\b(years?|months?|days?|hours?|minutes?|people|passengers?|miles?|kilometers?|mg|milligrams?|percent|%)\b",
+                text.lower(),
+            ):
+                return True
+
+        # 四个词以上通常已是有意义的自然答案；这样 belongs/contains/provides 等
+        # 未列入 Task1 白名单的正确谓语不会再次被覆盖成 IDK。
+        if len(words) >= 4:
+            return False
+        return super()._needs_sentence_rewrite(text, query, candidates)
 
     def _rewrite_task2_as_sentence(
         self,

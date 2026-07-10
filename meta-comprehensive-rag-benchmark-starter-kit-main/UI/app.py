@@ -1,13 +1,16 @@
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFrame,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -17,18 +20,101 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
+    QSplitter,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-PYTHON_EXE = os.environ.get("CRAGMM_PYTHON", r"C:\anaconda\python.exe")
+PYTHON_EXE = os.environ.get("CRAGMM_PYTHON") or sys.executable
+LIVE_EVENT_PREFIX = "__CRAGMM_LIVE_EVENT__"
+
+
+class ConversationView(QWidget):
+    """单个测试会话的聊天视图；Task3 的多轮消息会持续追加到同一页。"""
+
+    def __init__(self):
+        super().__init__()
+        self.image_shown = False
+        self.seen_turns = set()
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+
+        self.content = QWidget()
+        self.messages = QVBoxLayout(self.content)
+        self.messages.setContentsMargins(12, 12, 12, 12)
+        self.messages.setSpacing(10)
+        self.messages.addStretch(1)
+        self.scroll.setWidget(self.content)
+        root_layout.addWidget(self.scroll)
+
+    def add_event(self, event):
+        turn = int(event.get("turn", 0))
+        if turn in self.seen_turns:
+            return
+        self.seen_turns.add(turn)
+
+        image_path = str(event.get("image_path", ""))
+        if image_path and not self.image_shown:
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                image_label = QLabel()
+                image_label.setAlignment(Qt.AlignCenter)
+                image_label.setPixmap(
+                    pixmap.scaled(460, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+                image_label.setStyleSheet("background: #151515; padding: 8px; border: 1px solid #3a3a3a;")
+                self.messages.insertWidget(self.messages.count() - 1, image_label)
+                self.image_shown = True
+
+        self._add_bubble(f"Query · Turn {turn + 1}", str(event.get("query", "")), is_user=True)
+        self._add_bubble("Agent Response", str(event.get("response", "")), is_user=False)
+        QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def _add_bubble(self, title, text, is_user):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        bubble = QFrame()
+        bubble.setMaximumWidth(500)
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(12, 9, 12, 10)
+        bubble_layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 11px; font-weight: 700; color: #bfc7d5;")
+        body = QLabel(text or "(empty response)")
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setStyleSheet("font-size: 13px; color: #f2f2f2;")
+        bubble_layout.addWidget(title_label)
+        bubble_layout.addWidget(body)
+
+        if is_user:
+            bubble.setStyleSheet("QFrame { background: #174a73; border: 1px solid #286a9c; border-radius: 6px; }")
+            row.addStretch(1)
+            row.addWidget(bubble)
+        else:
+            bubble.setStyleSheet("QFrame { background: #303030; border: 1px solid #484848; border-radius: 6px; }")
+            row.addWidget(bubble)
+            row.addStretch(1)
+        self.messages.insertLayout(self.messages.count() - 1, row)
+
+    def _scroll_to_bottom(self):
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
 
 class EvalWorker(QThread):
     output = Signal(str)
+    live_event = Signal(object)
     finished_with_code = Signal(int)
 
     def __init__(self, command, env):
@@ -51,7 +137,18 @@ class EvalWorker(QThread):
         )
         assert self.process.stdout is not None
         for line in self.process.stdout:
-            self.output.emit(line)
+            marker = line.find(LIVE_EVENT_PREFIX)
+            if marker < 0:
+                self.output.emit(line)
+                continue
+            if marker > 0:
+                self.output.emit(line[:marker])
+            payload_text = line[marker + len(LIVE_EVENT_PREFIX):].strip()
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(payload_text)
+                self.live_event.emit(payload)
+            except Exception:
+                self.output.emit(line)
         self.finished_with_code.emit(self.process.wait())
 
     def stop(self):
@@ -63,8 +160,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
+        self.conversation_views = {}
+        self.conversation_numbers = {}
         self.setWindowTitle("CRAG-MM 智能实训工具")
-        self.resize(980, 760)
+        self.resize(1320, 860)
         self._build_ui()
         self._sync_task_defaults()
 
@@ -95,6 +194,7 @@ class MainWindow(QMainWindow):
         self.agent_combo = QComboBox()
         self.agent_combo.addItem("Task1KGAgent（Task1 知识图谱）", "task1kg")
         self.agent_combo.addItem("Task2Agent（Task2 多源增强）", "task2agent")
+        self.agent_combo.addItem("Task3Agent（Task3 上下文优化）", "task3agent")
         self.agent_combo.addItem("项目 user_config.UserAgent", "user_config")
         form.addRow("智能体", self.agent_combo)
 
@@ -162,11 +262,29 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("命令预览"))
         layout.addWidget(self.command_preview)
 
+        results_splitter = QSplitter(Qt.Horizontal)
+
+        output_panel = QWidget()
+        output_layout = QVBoxLayout(output_panel)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.addWidget(QLabel("输出"))
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
-        layout.addWidget(QLabel("输出"))
-        layout.addWidget(self.output, 1)
+        output_layout.addWidget(self.output, 1)
+
+        live_group = QGroupBox("实时测试对话")
+        live_layout = QVBoxLayout(live_group)
+        self.live_tabs = QTabWidget()
+        self.live_tabs.setDocumentMode(True)
+        live_layout.addWidget(self.live_tabs)
+
+        results_splitter.addWidget(output_panel)
+        results_splitter.addWidget(live_group)
+        results_splitter.setStretchFactor(0, 1)
+        results_splitter.setStretchFactor(1, 1)
+        results_splitter.setSizes([600, 700])
+        layout.addWidget(results_splitter, 1)
 
         self.setCentralWidget(root)
         self._sync_mode()
@@ -285,6 +403,8 @@ class MainWindow(QMainWindow):
         env["CRAG_WEBSEARCH_CACHE_DIR"] = str(dataset_dir / "crag_web_search")
         env["TASK1_DEBUG_PATH"] = str(ROOT_DIR / "UI" / "outputs" / "task1" / "debug.jsonl")
         env["TASK2_DEBUG_PATH"] = str(ROOT_DIR / "UI" / "outputs" / "task2" / "debug.jsonl")
+        env["TASK3_DEBUG_PATH"] = str(ROOT_DIR / "UI" / "outputs" / "task3" / "debug.jsonl")
+        env["CRAGMM_LIVE_EVENTS"] = "1"
         return env
 
     def _update_command_preview(self):
@@ -296,12 +416,34 @@ class MainWindow(QMainWindow):
                 self.output.setPlainText("自定义 Task1 模式需要同时选择图片并填写问题。\n")
                 return
         self.output.clear()
+        self._clear_live_conversations()
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.worker = EvalWorker(self._build_command(), self._build_env())
         self.worker.output.connect(self.output.insertPlainText)
+        self.worker.live_event.connect(self._append_live_event)
         self.worker.finished_with_code.connect(self._finished)
         self.worker.start()
+
+    def _clear_live_conversations(self):
+        self.conversation_views.clear()
+        self.conversation_numbers.clear()
+        while self.live_tabs.count():
+            widget = self.live_tabs.widget(0)
+            self.live_tabs.removeTab(0)
+            widget.deleteLater()
+
+    def _append_live_event(self, event):
+        conversation_id = str(event.get("conversation_id", "unknown"))
+        view = self.conversation_views.get(conversation_id)
+        if view is None:
+            view = ConversationView()
+            number = len(self.conversation_views) + 1
+            self.conversation_views[conversation_id] = view
+            self.conversation_numbers[conversation_id] = number
+            self.live_tabs.addTab(view, f"会话 {number}")
+        view.add_event(event)
+        self.live_tabs.setCurrentWidget(view)
 
     def _stop_eval(self):
         if self.worker:

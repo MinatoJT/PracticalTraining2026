@@ -1,8 +1,13 @@
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
 import sys
+import threading
+import time
+from functools import wraps
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -20,6 +25,7 @@ os.environ.setdefault("CRAG_CACHE_DIR", str(DATASET_DIR / "crag_images"))
 os.environ.setdefault("CRAG_WEBSEARCH_CACHE_DIR", str(DATASET_DIR / "crag_web_search"))
 os.environ.setdefault("TASK1_DEBUG_PATH", str(ROOT_DIR / "UI" / "outputs" / "task1" / "debug.jsonl"))
 os.environ.setdefault("TASK2_DEBUG_PATH", str(ROOT_DIR / "UI" / "outputs" / "task2" / "debug.jsonl"))
+os.environ.setdefault("TASK3_DEBUG_PATH", str(ROOT_DIR / "UI" / "outputs" / "task3" / "debug.jsonl"))
 os.environ.setdefault("PANDAS_USE_NUMEXPR", "0")
 os.environ.setdefault("PANDAS_USE_BOTTLENECK", "0")
 
@@ -28,6 +34,7 @@ from rich.console import Console
 
 from agents.Task1KGAgent import Task1KGAgent
 from agents.Task2Agent import Task2Agent
+from agents.Task3Agent import Task3Agent
 import types
 _fake_user_config = types.ModuleType("agents.user_config")
 _fake_user_config.UserAgent = Task1KGAgent
@@ -65,6 +72,58 @@ class _TokenizerFactory:
 local_evaluation.Tokenizer = _TokenizerFactory
 CRAGEvaluator = local_evaluation.CRAGEvaluator
 console = Console()
+LIVE_EVENT_PREFIX = "__CRAGMM_LIVE_EVENT__"
+
+
+def install_live_event_stream(agent, task: str) -> None:
+    """包装 Agent 批量接口，把每轮问答和图片作为 JSON 行实时发送给 Qt。"""
+    if os.environ.get("CRAGMM_LIVE_EVENTS", "0") != "1":
+        return
+
+    original = agent.batch_generate_response
+    emit_lock = threading.Lock()
+    run_id = f"{int(time.time())}_{os.getpid()}"
+    image_dir = ROOT_DIR / "UI" / "outputs" / "live" / run_id
+    image_dir.mkdir(parents=True, exist_ok=True)
+    saved_images = {}
+
+    def prepare_image(image):
+        """生成稳定会话标识并保存轻量缩略图；同一多轮图片只保存一次。"""
+        try:
+            preview = image.convert("RGB").copy()
+            preview.thumbnail((720, 540))
+            buffer = io.BytesIO()
+            preview.save(buffer, format="JPEG", quality=88)
+            data = buffer.getvalue()
+            conversation_id = hashlib.sha1(data).hexdigest()[:12]
+            if conversation_id not in saved_images:
+                path = image_dir / f"{conversation_id}.jpg"
+                path.write_bytes(data)
+                saved_images[conversation_id] = str(path)
+            return conversation_id, saved_images[conversation_id]
+        except Exception:
+            fallback_id = f"unknown-{len(saved_images) + 1}"
+            return fallback_id, ""
+
+    @wraps(original)
+    def wrapped(queries, images, message_histories):
+        responses = original(queries, images, message_histories)
+        with emit_lock:
+            for query, image, history, response in zip(queries, images, message_histories, responses):
+                conversation_id, image_path = prepare_image(image)
+                event = {
+                    "task": task,
+                    "conversation_id": conversation_id,
+                    "turn": len(history or []) // 2,
+                    "query": str(query),
+                    "response": str(response),
+                    "history": history or [],
+                    "image_path": image_path,
+                }
+                print(LIVE_EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+        return responses
+
+    agent.batch_generate_response = wrapped
 
 
 def _semantic_shortcut(query: str, ground_truth: str, prediction: str) -> bool:
@@ -206,7 +265,7 @@ def build_search_pipeline(task: str):
 def main():
     parser = argparse.ArgumentParser(description="CRAG-MM 本地评测 UI 后端")
     parser.add_argument("--task", choices=["task1", "task2", "task3"], default="task1")
-    parser.add_argument("--agent", choices=["task1kg", "task2agent", "user_config"], default="task1kg")
+    parser.add_argument("--agent", choices=["task1kg", "task2agent", "task3agent", "user_config"], default="task1kg")
     parser.add_argument("--num-conversations", type=int, default=20)
     parser.add_argument("--display-conversations", type=int, default=5)
     parser.add_argument("--eval-model", default="None")
@@ -238,12 +297,15 @@ def main():
         agent_cls = Task1KGAgent
     elif args.agent == "task2agent":
         agent_cls = Task2Agent
+    elif args.agent == "task3agent":
+        agent_cls = Task3Agent
     else:
         import importlib
         sys.modules.pop("agents.user_config", None)
         ProjectUserAgent = importlib.import_module("agents.user_config").UserAgent
         agent_cls = ProjectUserAgent
     agent = agent_cls(search_pipeline=search_pipeline)
+    install_live_event_stream(agent, args.task)
 
     evaluator = CRAGEvaluator(
         dataset=selected,
