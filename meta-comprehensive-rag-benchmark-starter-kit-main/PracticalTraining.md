@@ -1,5 +1,20 @@
 # Practical Training Notes
 
+## Task2/Task3 Systematic Fix (2026-07-12)
+
+- `Task1KGAgent._call_llm(messages, max_tokens, purpose)`: Task1/2/3 共用 DeepSeek 调用入口。默认关闭思考模式，避免短结构化请求只产生 `reasoning_content` 而 `content` 为空；记录模型、choices 数、finish reason、content/reasoning 长度和 token usage，但不记录 API Key 或思维链正文。
+- `Task1KGAgent.set_trace_contexts(contexts)`: evaluator 注入 `session_id`、`interaction_id`、`turn_idx`，供 Task3 维护会话状态和生成逐轮日志。
+- `Task2Agent._build_web_evidence(results, source)`: 网页证据标记为 `broad` 或 `entity_directed`。只有 broad 结果允许进入 `_rerank_kg_with_web()`，阻断错误 top1 通过定向搜索自我强化。
+- `Task2Agent._build_task2_answer_messages_clean(...)`: 使用 UTF-8 中文 Prompt，明确暂定视觉实体、KG 候选、Web 来源和回答格式。
+- `Task3Agent._update_visual_anchor(...)`: 按 `session_id` 保存结构化视觉锚点、候选、图像分和 margin。后续无图检索轮次沿用候选；显式重新看图时允许新证据覆盖旧锚点。
+- `Task3Agent._looks_like_followup(query)`: 按代词和追问短语判断，不再使用“词数小于等于 5”规则。
+- `Task3Agent._should_use_image(...)`: 除首轮外，颜色、外观和明确图片指向的问题也会重新读取图片。
+- `conversation_validation.valid_conversation_indices(dataset, requested)`: 先排除 ground truth 缺失的坏会话，再选择请求数量。原第 5 个候选会话有空答案，旧 iterator 将其跳过，所以请求 5 组只统计 4 组。
+- `CRAGEvaluator.generate_agent_responses()`: 显式校验 queries/images/history/response 数量，禁止 `zip()` 静默截断，并注入逐轮 trace context。
+- `UI/run_eval.py::patch_deepseek_judge()`: 语义 Judge 同样关闭思考模式，避免短 JSON 请求只返回 reasoning 后误判。
+- 每次 UI 运行写入独立的 `UI/outputs/<task>/trace_<run_id>.jsonl`。日志包含空回答分类、IDK 原因、质量分支、视觉锚点和 KG 分数组成。
+- `testTask23Diagnostics.py`: 不联网回归测试，覆盖 reasoning-only、length、空 choices、Web 投票隔离、视觉锚点建立与纠错、短问题判断、合法短答案、批量长度和有效会话选择。
+
 ## Task1KGAgent
 
 新增 `agents/Task1KGAgent.py`，用于 Task1 单源增强：

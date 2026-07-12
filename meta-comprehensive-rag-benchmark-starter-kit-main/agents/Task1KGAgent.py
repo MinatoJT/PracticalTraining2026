@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import re
 from pathlib import Path
@@ -34,7 +34,11 @@ class Task1KGAgent(BaseAgent):
         self.model_name = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        # DeepSeek V4 默认开启思考模式。短结构化调用会先耗尽 reasoning token，
+        # 导致 message.content 为空，因此实训默认关闭；可用环境变量显式重新开启。
+        self.deepseek_thinking = os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower()
         self.debug_path = os.getenv("TASK1_DEBUG_PATH")
+        self._trace_contexts: List[Dict[str, Any]] = []
         self.client = self._build_client()
         self._debug({"event": "init", "has_api_key": bool(self.api_key), "model": self.model_name, "has_client": self.client is not None})
 
@@ -42,12 +46,26 @@ class Task1KGAgent(BaseAgent):
         # Task1 调试阶段按条生成，确保 --num-conversations=5 时不会因 batch 超量多花 API。
         return 1
 
+    def set_trace_contexts(self, contexts: List[Dict[str, Any]]) -> None:
+        """由评测器在每批生成前注入 session/turn 标识，供多轮锚点和诊断日志使用。"""
+        self._trace_contexts = list(contexts or [])
+
+    def _trace_context(self, index: int = 0) -> Dict[str, Any]:
+        if 0 <= index < len(self._trace_contexts):
+            return dict(self._trace_contexts[index])
+        return {}
+
     def batch_generate_response(
         self,
         queries: List[str],
         images: List[Image.Image],
         message_histories: List[List[Dict[str, Any]]],
     ) -> List[str]:
+        if not (len(queries) == len(images) == len(message_histories)):
+            raise ValueError(
+                "Task1 批量输入长度不一致："
+                f"queries={len(queries)}, images={len(images)}, histories={len(message_histories)}"
+            )
         responses = []
         for query, image, history in zip(queries, images, message_histories):
             # 1. 调用官方 Task1 图像检索 API，获得相似图像及其 KG 实体。
@@ -85,6 +103,80 @@ class Task1KGAgent(BaseAgent):
         except ImportError:
             return None
         return OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+    def _call_llm(self, messages: List[Dict[str, str]], max_tokens: int, purpose: str) -> str:
+        """统一调用 DeepSeek，并记录可审计的响应结构（不记录 API Key 或思维链正文）。"""
+        kwargs = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        if self.deepseek_thinking != "enabled":
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+        response = self.client.chat.completions.create(**kwargs)
+        choices = list(getattr(response, "choices", None) or [])
+        message = getattr(choices[0], "message", None) if choices else None
+        content = str(getattr(message, "content", None) or "")
+        reasoning = str(getattr(message, "reasoning_content", None) or "")
+        refusal = str(getattr(message, "refusal", None) or "")
+        finish_reason = str(getattr(choices[0], "finish_reason", None) or "") if choices else ""
+        usage = getattr(response, "usage", None)
+
+        if not choices:
+            empty_reason = "choices_empty"
+        elif refusal:
+            empty_reason = "refusal"
+        elif content:
+            empty_reason = ""
+        elif finish_reason == "length":
+            empty_reason = "finish_length"
+        elif reasoning:
+            empty_reason = "reasoning_only"
+        else:
+            empty_reason = "empty_content"
+
+        self._log_llm_diagnostic({
+            "event": "llm_response",
+            "purpose": purpose,
+            "requested_model": self.model_name,
+            "response_model": str(getattr(response, "model", "") or ""),
+            "thinking": self.deepseek_thinking,
+            "choices_count": len(choices),
+            "finish_reason": finish_reason,
+            "content_length": len(content),
+            "reasoning_length": len(reasoning),
+            "has_refusal": bool(refusal),
+            "has_tool_calls": bool(getattr(message, "tool_calls", None)) if message else False,
+            "empty_reason": empty_reason,
+            "usage": {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            },
+        })
+        return content
+
+    def _log_llm_diagnostic(self, payload: Dict[str, Any]) -> None:
+        """把公共 LLM 诊断同时写入当前 Agent 的调试文件，避免 Task2/3 日志遗漏。"""
+        paths = {
+            str(path)
+            for path in (
+                self.debug_path,
+                getattr(self, "task2_debug_path", None),
+                getattr(self, "task3_debug_path", None),
+            )
+            if path
+        }
+        for raw_path in paths:
+            try:
+                path = Path(raw_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     def _image_search(self, image: Image.Image) -> List[Dict[str, Any]]:
         # Task1 的关键接口：传入 PIL Image，返回相似图像及其 KG 实体，而不是文本检索结果。
@@ -204,13 +296,11 @@ class Task1KGAgent(BaseAgent):
     def _select_entity_with_llm(self, query: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         # DeepSeek 实体选择接口：只负责从候选中选实体，不负责回答问题。
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self._build_entity_selection_messages(query, candidates),
-                temperature=0.0,
-                max_tokens=24,
+            raw = self._call_llm(
+                self._build_entity_selection_messages(query, candidates),
+                max_tokens=96,
+                purpose="entity_selection",
             )
-            raw = response.choices[0].message.content or ""
             selected = self._parse_entity_selection(raw, candidates)
             self._debug({"event": "entity_select", "query": query, "raw": raw[:300], "selected": selected.get("entity_name") if selected else None})
             return selected
@@ -223,7 +313,10 @@ class Task1KGAgent(BaseAgent):
         rows = []
         for idx, item in enumerate(candidates, start=1):
             attrs = item.get("attributes", {})
-            attr_text = "; ".join(f"{k}: {v}" for k, v in list(attrs.items())[:6])
+            attr_text = "; ".join(
+                f"{k}: {' '.join(str(v).split())[:180]}"
+                for k, v in list(attrs.items())[:3]
+            )
             rows.append(f"{idx}. 实体={item.get('entity_name')} 图像分={item.get('score')} 规则分={item.get('rule_score')} 属性={attr_text}")
         system = (
             "你是多模态问答中的实体选择器。根据问题和候选实体，选择最可能是图片主体、且最适合回答问题的实体。"
@@ -259,13 +352,11 @@ class Task1KGAgent(BaseAgent):
         if not candidates:
             return "I don't know"
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self._build_answer_messages(query, selected or candidates[0], candidates, history),
-                temperature=0.0,
-                max_tokens=110,
+            answer = self._call_llm(
+                self._build_answer_messages(query, selected or candidates[0], candidates, history),
+                max_tokens=512,
+                purpose="task1_answer",
             )
-            answer = response.choices[0].message.content or ""
             if self._needs_sentence_rewrite(answer, query, candidates):
                 rewritten = self._rewrite_as_sentence(query, answer, selected or candidates[0], candidates, history)
                 answer = rewritten or answer
@@ -393,9 +484,8 @@ class Task1KGAgent(BaseAgent):
         # 二次改写接口：把短语/实体名强制改写成完整句，仍基于同一批 KG 候选。
         candidate_text = self._format_candidate_evidence(candidates)
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            rewritten = self._call_llm(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -415,10 +505,9 @@ class Task1KGAgent(BaseAgent):
                         ),
                     },
                 ],
-                temperature=0.0,
-                max_tokens=120,
+                max_tokens=192,
+                purpose="task1_sentence_rewrite",
             )
-            rewritten = response.choices[0].message.content or ""
             self._debug({"event": "sentence_rewrite", "query": query, "bad_answer": bad_answer[:160], "rewritten": rewritten[:220]})
             return rewritten
         except Exception as exc:
@@ -440,7 +529,9 @@ class Task1KGAgent(BaseAgent):
                 continue
             if normalized_answer == normalized_entity or normalized_answer in normalized_entity:
                 return True
-            if normalized_entity in normalized_answer and (len(answer_words) <= 4 or not has_sentence_verb):
+            # 实体名出现在完整句中是正常的；只拦截“几乎只有实体名”的极短输出。
+            # 旧逻辑依赖固定谓语白名单，会误伤 indicate/produce/provide 等正常句子。
+            if normalized_entity in normalized_answer and len(answer_words) <= 4:
                 return True
         return False
 
@@ -451,7 +542,10 @@ class Task1KGAgent(BaseAgent):
         rows = []
         for idx, item in enumerate(candidates, start=1):
             attrs = item.get("attributes", {}) or {}
-            attr_text = "; ".join(f"{k}: {v}" for k, v in list(attrs.items())[:attr_limit]) or "None"
+            attr_text = "; ".join(
+                f"{k}: {' '.join(str(v).split())[:300]}"
+                for k, v in list(attrs.items())[:attr_limit]
+            ) or "None"
             rows.append(
                 f"{idx}. entity={item.get('entity_name', '')}; "
                 f"image_score={item.get('score', 0.0)}; rule_score={item.get('rule_score', 0.0)}; "
@@ -463,16 +557,14 @@ class Task1KGAgent(BaseAgent):
         # 如果模型只返回实体名，则二次追问，强制从候选集合中抽取属性/判断。
         candidate_text = self._format_candidate_evidence(candidates)
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            repaired = self._call_llm(
+                [
                     {"role": "system", "content": "你刚才只输出了实体名。现在必须从候选实体和属性中选择能回答问题的信息，直接回答问题本身。英文问题用英文回答，不能只输出实体名。"},
                     {"role": "user", "content": f"问题：{query}\n候选实体与属性：\n{candidate_text}\n请回答问题所问的事实、判断、数值、日期、来源或安全建议。"},
                 ],
-                temperature=0.0,
-                max_tokens=110,
+                max_tokens=512,
+                purpose="task1_entity_echo_repair",
             )
-            repaired = response.choices[0].message.content or ""
             self._debug({"event": "entity_echo_repair", "query": query, "selected": selected.get("entity_name"), "answer": repaired[:200]})
             return repaired
         except Exception as exc:

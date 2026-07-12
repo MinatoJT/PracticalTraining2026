@@ -47,10 +47,13 @@ class Task3Agent(Task2Agent):
         )
 
         self.context_turn_limit = int(os.getenv("TASK3_CONTEXT_TURN_LIMIT", str(context_turn_limit)))
-        self.rewrite_with_llm = os.getenv("TASK3_DISABLE_QUERY_REWRITE", "0") != "1"
+        # 默认使用可审计的规则改写；需要实验 LLM 改写时可显式设置为 0。
+        self.rewrite_with_llm = os.getenv("TASK3_DISABLE_QUERY_REWRITE", "1") != "1"
         self.task3_debug_path = os.getenv("TASK3_DEBUG_PATH") or str(
             Path(__file__).resolve().parents[1] / "UI" / "outputs" / "task3" / "debug.jsonl"
         )
+        # 每个会话保存首轮视觉检索形成的暂定锚点，后续追问沿用，但显式重看图片时可覆盖。
+        self.visual_anchors: Dict[str, Dict[str, Any]] = {}
 
         self._debug_task3({
             "event": "task3_init",
@@ -90,7 +93,8 @@ class Task3Agent(Task2Agent):
 
         if category_match:
             # 只使用实体名和结构化字段判断类别，不能让品牌 description 中偶然出现的 animal 一词获加分。
-            score += 1.0
+            # 类别只做轻量平局裁决，不能压过原始图像相似度。
+            score += 0.03
         return round(score, 4)
 
     def batch_generate_response(
@@ -99,10 +103,18 @@ class Task3Agent(Task2Agent):
         images: List[Image.Image],
         message_histories: List[List[Dict[str, Any]]],
     ) -> List[str]:
+        if not (len(queries) == len(images) == len(message_histories)):
+            raise ValueError(
+                "Task3 批量输入长度不一致："
+                f"queries={len(queries)}, images={len(images)}, histories={len(message_histories)}"
+            )
         responses = []
 
-        for query, image, history in zip(queries, images, message_histories):
-            context = self._build_context_state(history)
+        for batch_index, (query, image, history) in enumerate(zip(queries, images, message_histories)):
+            trace = self._trace_context(batch_index)
+            session_id = str(trace.get("session_id") or "")
+            anchor = self.visual_anchors.get(session_id, {}) if session_id else {}
+            context = self._build_context_state(history, anchor)
             contextual_query = self._rewrite_query_with_context(query, context)
 
             # 1. 数据集会在每一轮重复传入同一张图片。首轮或明确再次询问图片时才检索图片，
@@ -113,7 +125,8 @@ class Task3Agent(Task2Agent):
                 kg_evidence = self._build_evidence(raw_image_results)
             else:
                 raw_image_results = []
-                kg_evidence = []
+                # 普通知识追问沿用首轮视觉候选，避免每轮重搜造成主体漂移，也避免 KG 为空。
+                kg_evidence = [dict(item) for item in anchor.get("candidates", [])]
 
             ranked_kg = self._rank_candidates_by_rules(contextual_query, kg_evidence)
             ranked_kg = self._rerank_kg_with_context(ranked_kg, contextual_query, context)
@@ -122,14 +135,24 @@ class Task3Agent(Task2Agent):
 
             # 2. 多轮问题经常含有 it/that/this 等指代词，web query 使用改写后的独立问题。
             web_query = self._build_task3_web_query(contextual_query, context, initial_entity, initial_support or ranked_kg)
-            raw_web_results = self._merge_web_results(
-                self._web_search(contextual_query),
+            broad_web = self._build_web_evidence(self._web_search(contextual_query), source="broad")
+            entity_web = self._build_web_evidence(
                 self._web_search(web_query) if web_query.lower() != contextual_query.lower() else [],
+                source="entity_directed",
             )
-            web_evidence = self._build_web_evidence(raw_web_results)
-            ranked_kg = self._rerank_kg_with_web(ranked_kg, web_evidence)
+            web_evidence = self._merge_web_results(broad_web, entity_web)
+            ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
             support_entities = self._select_supporting_entities(contextual_query, ranked_kg)
             selected_entity = self._select_entity(contextual_query, support_entities or ranked_kg)
+
+            if use_image and session_id and selected_entity:
+                anchor = self._update_visual_anchor(
+                    session_id,
+                    selected_entity,
+                    support_entities or ranked_kg,
+                    trace.get("turn_idx"),
+                )
+                context["visual_anchor"] = anchor
             ranked_web = self._rank_web_evidence(
                 query=contextual_query,
                 web_query=web_query,
@@ -168,11 +191,27 @@ class Task3Agent(Task2Agent):
             self._debug_task3({
                 "event": "task3_query",
                 "query": query,
+                "session_id": session_id,
+                "interaction_id": trace.get("interaction_id"),
+                "turn_idx": trace.get("turn_idx"),
                 "contextual_query": contextual_query,
                 "history_turns": len(context.get("turns", [])),
                 "use_image": use_image,
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
+                "anchor_entity": (anchor.get("selected_entity") or {}).get("entity_name") if anchor else None,
+                "image_score": anchor.get("image_score") if anchor else None,
+                "image_margin": anchor.get("image_margin") if anchor else None,
                 "kg_count": len(kg_evidence),
+                "kg_score_components": [
+                    {
+                        "entity": item.get("entity_name"),
+                        "image_score": item.get("score"),
+                        "context_support_score": item.get("context_support_score", 0.0),
+                        "web_support_score": item.get("web_support_score", 0.0),
+                        "final_score": item.get("rule_score"),
+                    }
+                    for item in ranked_kg[: self.rerank_top_n]
+                ],
                 "web_query": web_query,
                 "web_count": len(web_evidence),
                 "ranked_web_titles": [item.get("title") for item in ranked_web[: self.web_keep_top_n]],
@@ -182,11 +221,35 @@ class Task3Agent(Task2Agent):
 
         return responses
 
+    def _update_visual_anchor(
+        self,
+        session_id: str,
+        selected_entity: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        turn_idx: Any,
+    ) -> Dict[str, Any]:
+        """写入或纠正会话视觉锚点；显式重新看图得到的新证据可以覆盖旧锚点。"""
+        anchor_candidates = [dict(item) for item in candidates[: self.rerank_top_n]]
+        scores = [float(item.get("score", 0.0) or 0.0) for item in anchor_candidates]
+        anchor = {
+            "selected_entity": dict(selected_entity),
+            "candidates": anchor_candidates,
+            "image_score": scores[0] if scores else 0.0,
+            "image_margin": (scores[0] - scores[1]) if len(scores) > 1 else 0.0,
+            "turn_idx": turn_idx,
+        }
+        self.visual_anchors[session_id] = anchor
+        return anchor
+
     # ------------------------------------------------------------------
     # 上下文优化
     # ------------------------------------------------------------------
 
-    def _build_context_state(self, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_context_state(
+        self,
+        history: List[Dict[str, Any]],
+        visual_anchor: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         # 将官方 evaluator 传入的 message_history 压缩成短上下文，避免把过长历史直接塞进检索 query。
         history = history or []
         turns = []
@@ -206,6 +269,10 @@ class Task3Agent(Task2Agent):
         history_text = "\n".join(f"{item['role']}: {item['content']}" for item in trusted_turns) if trusted_turns else "None"
         user_history_text = " ".join(item["content"] for item in trusted_turns if item["role"] == "user")
 
+        anchor_name = str((visual_anchor or {}).get("selected_entity", {}).get("entity_name", "")).strip()
+        recent_entities = self._extract_recent_entities(user_history_text)
+        if anchor_name and anchor_name.lower() not in {item.lower() for item in recent_entities}:
+            recent_entities.insert(0, anchor_name)
         return {
             "turns": turns,
             "trusted_turns": trusted_turns,
@@ -213,7 +280,8 @@ class Task3Agent(Task2Agent):
             "last_user_question": last_user,
             "last_assistant_answer": last_assistant,
             "user_history_text": user_history_text,
-            "recent_entities": self._extract_recent_entities(user_history_text),
+            "recent_entities": recent_entities,
+            "visual_anchor": visual_anchor or {},
             "has_history": bool(trusted_turns),
         }
 
@@ -262,9 +330,8 @@ class Task3Agent(Task2Agent):
     def _rewrite_query_with_llm(self, query: str, context: Dict[str, Any]) -> str:
         # DeepSeek 只负责把当前轮改写成独立检索问题，不负责生成最终答案。
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            rewritten = self._call_llm(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -283,10 +350,9 @@ class Task3Agent(Task2Agent):
                         ),
                     },
                 ],
-                temperature=0.0,
-                max_tokens=90,
+                max_tokens=192,
+                purpose="task3_query_rewrite",
             )
-            rewritten = response.choices[0].message.content or ""
             rewritten = self._clean_query_text(rewritten.strip().strip('"').strip("'"))
             if rewritten and "don't know" not in rewritten.lower():
                 self._debug_task3({"event": "task3_query_rewrite", "query": query, "rewritten": rewritten})
@@ -334,9 +400,8 @@ class Task3Agent(Task2Agent):
     ) -> str:
         # Task3 回答接口：强调历史一致性，同时沿用 Task1/Task2 的完整句质量闸门。
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self._build_task3_answer_messages(
+            answer = self._call_llm(
+                self._build_task3_answer_messages_clean(
                     original_query=original_query,
                     contextual_query=contextual_query,
                     context=context,
@@ -345,19 +410,22 @@ class Task3Agent(Task2Agent):
                     web_evidence=web_evidence,
                     fused_context=fused_context,
                 ),
-                temperature=0.0,
-                max_tokens=150,
+                max_tokens=512,
+                purpose="task3_answer",
             )
-            answer = response.choices[0].message.content or ""
             raw_answer = answer
+            quality_branches = []
 
             if self._needs_sentence_rewrite(answer, contextual_query, kg_candidates) or not self._answer_addresses_current_question(answer, original_query, context):
+                quality_branches.append("llm_rewrite")
                 answer = self._rewrite_task3_as_sentence(original_query, contextual_query, answer, context, kg_candidates, web_evidence) or answer
 
             if self._needs_sentence_rewrite(answer, contextual_query, kg_candidates) or not self._answer_addresses_current_question(answer, original_query, context):
+                quality_branches.append("heuristic_fallback")
                 answer = self._answer_with_heuristic_sentence(contextual_query, kg_candidates) or answer
 
             if self._needs_sentence_rewrite(answer, contextual_query, kg_candidates) or not self._answer_addresses_current_question(answer, original_query, context):
+                quality_branches.append("forced_idk")
                 answer = "I don't know."
 
             self._debug_task3({
@@ -366,6 +434,14 @@ class Task3Agent(Task2Agent):
                 "contextual_query": contextual_query,
                 "raw_answer": raw_answer[:260],
                 "answer": answer[:260],
+                "quality_branches": quality_branches,
+                "is_idk": "i don't know" in answer.lower(),
+                "idk_reason": (
+                    "empty_llm_content" if not raw_answer.strip()
+                    else "llm_returned_idk" if "i don't know" in raw_answer.lower()
+                    else "quality_gate" if "forced_idk" in quality_branches
+                    else ""
+                ),
             })
             return answer
 
@@ -411,6 +487,40 @@ class Task3Agent(Task2Agent):
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
+    def _build_task3_answer_messages_clean(
+        self,
+        original_query: str,
+        contextual_query: str,
+        context: Dict[str, Any],
+        selected_entity: Optional[Dict[str, Any]],
+        kg_candidates: List[Dict[str, Any]],
+        web_evidence: List[Dict[str, Any]],
+        fused_context: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """构造 UTF-8 中文 Task3 Prompt，显式提供会话锚点并允许新证据纠错。"""
+        anchor = context.get("visual_anchor", {}) or {}
+        anchor_name = str((anchor.get("selected_entity") or {}).get("entity_name", "未确定"))
+        selected_name = selected_entity.get("entity_name", "未确定") if selected_entity else "未确定"
+        system = (
+            "你是 CRAG-MM Task3 多轮视觉问答助手。每一轮都必须回答当前问题，并保持同一会话中的图片主体一致。"
+            "视觉锚点是首轮图片检索得到的暂定主体，不是绝对真相；若当前问题或新的直接证据与它冲突，应纠正锚点。"
+            "历史 assistant 回答可能错误，只能作为弱线索，不能覆盖用户问题、视觉候选和直接网页事实。"
+            "正确解析 it、this、that、the company、the city 等指代。问题询问属性时必须给出该属性，不能重复上一轮主体名称。"
+            "只有历史、视觉候选和网页证据都不能支持答案时才回答 I don't know."
+            "英文问题使用英文完整句回答，最多两句，不得提及检索、KG、候选、网页或推理过程。"
+        )
+        user = (
+            f"历史对话：\n{context.get('history_text', 'None')}\n\n"
+            f"当前问题：{original_query}\n"
+            f"用于检索的上下文问题：{contextual_query}\n\n"
+            f"会话视觉锚点：{anchor_name}\n"
+            f"本轮暂定实体：{selected_name}\n\n"
+            f"视觉候选与属性：\n{self._format_kg_candidates(kg_candidates[:self.rerank_top_n])}\n\n"
+            f"网页补充证据：\n{self._format_web_evidence(web_evidence[:self.web_keep_top_n])}\n\n"
+            "请直接输出当前问题的最终英文答案。"
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
     def _rewrite_task3_as_sentence(
         self,
         original_query: str,
@@ -422,9 +532,8 @@ class Task3Agent(Task2Agent):
     ) -> str:
         # 二次改写接口：当模型输出短语/实体名时，强制生成与多轮上下文一致的完整句。
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            rewritten = self._call_llm(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -446,10 +555,9 @@ class Task3Agent(Task2Agent):
                         ),
                     },
                 ],
-                temperature=0.0,
-                max_tokens=150,
+                max_tokens=192,
+                purpose="task3_sentence_rewrite",
             )
-            rewritten = response.choices[0].message.content or ""
             self._debug_task3({"event": "task3_sentence_rewrite", "query": original_query, "bad_answer": bad_answer[:160], "rewritten": rewritten[:220]})
             return rewritten
         except Exception as exc:
@@ -475,7 +583,8 @@ class Task3Agent(Task2Agent):
         explicit_image_terms = [
             "in the image", "in this image", "in the picture", "in this picture",
             "shown here", "on the chart", "on the package", "top left", "bottom left",
-            "top right", "bottom right",
+            "top right", "bottom right", "what color", "which color", "appearance",
+            "look like", "visible", "shown", "pictured",
         ]
         return any(term in query_l for term in explicit_image_terms)
 
@@ -514,13 +623,14 @@ class Task3Agent(Task2Agent):
         return isinstance(image, Image.Image) and image.size[0] > 1 and image.size[1] > 1
 
     def _looks_like_followup(self, query: str) -> bool:
-        text = f" {str(query or '').lower()} "
-        followup_terms = [
-            " it ", " its ", " this ", " that ", " these ", " those ", " they ", " them ", " their ",
-            " he ", " she ", " his ", " her ", " also ", " same ", " previous ", " earlier ",
-            "what about", "how about", "and what", "then", "there", "the one",
-        ]
-        return any(term in text for term in followup_terms) or len(text.split()) <= 5
+        text = str(query or "").lower()
+        tokens = set(re.findall(r"[a-z0-9']+", text))
+        pronouns = {
+            "it", "its", "this", "that", "these", "those", "they", "them", "their",
+            "he", "she", "his", "her", "also", "same", "previous", "earlier", "there",
+        }
+        followup_phrases = ["what about", "how about", "and what", "the one"]
+        return bool(tokens & pronouns) or any(phrase in text for phrase in followup_phrases)
 
     def _extract_recent_entities(self, text: str) -> List[str]:
         # 从历史中粗略抽取实体/年份/型号，供检索 query 兜底使用，不参与最终回答判定。

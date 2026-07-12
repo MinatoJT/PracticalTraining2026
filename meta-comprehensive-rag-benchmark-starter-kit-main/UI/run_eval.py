@@ -12,6 +12,8 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
+from conversation_validation import valid_conversation_indices
+from evaluation_utils import build_deepseek_judge_prompt, semantic_shortcut
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 DATASET_DIR = ROOT_DIR / "Dataset"
 DATASET_DIR.mkdir(exist_ok=True)
@@ -127,6 +129,7 @@ def install_live_event_stream(agent, task: str) -> None:
 
 
 def _semantic_shortcut(query: str, ground_truth: str, prediction: str) -> bool:
+    return semantic_shortcut(query, ground_truth, prediction)
     """本地高置信语义捷径：答案已经明显覆盖关键词/数字时，避免 LLM judge JSON 截断误判。"""
     pred_l = prediction.lower()
     gt_l = ground_truth.lower()
@@ -198,7 +201,7 @@ def patch_deepseek_judge(eval_model_name):
         api_response = None
 
         if not is_idk and not is_exact_match:
-            if _semantic_shortcut(query, ground_truth, agent_response):
+            if os.environ.get("CRAGMM_SEMANTIC_SHORTCUT", "0") == "1" and _semantic_shortcut(query, ground_truth, agent_response):
                 api_response = {"accuracy": True, "reason": "local_semantic_shortcut"}
                 is_correct = True
                 is_semantically_correct = True
@@ -218,11 +221,13 @@ def patch_deepseek_judge(eval_model_name):
                         f"Ground truth: {ground_truth}\n"
                         f"Prediction: {agent_response}\n"
                     )
+                    prompt = build_deepseek_judge_prompt(query, ground_truth, agent_response)
                     response = client.chat.completions.create(
                         model=eval_model_name,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.0,
                         max_tokens=40,
+                        extra_body={"thinking": {"type": "disabled"}},
                     )
                     raw = response.choices[0].message.content or ""
                     parsed = _parse_deepseek_judge(raw)
@@ -262,6 +267,35 @@ def build_search_pipeline(task: str):
     )
 
 
+def _has_complete_answers(conversation: dict) -> tuple[bool, str]:
+    """检查多轮会话每个 turn 是否都有非空 ground truth。"""
+    turns = conversation.get("turns", []) or []
+    answers = conversation.get("answers", {}) or {}
+    if isinstance(answers, dict):
+        ids = list(answers.get("interaction_id", []) or [])
+        values = list(answers.get("ans_full", []) or [])
+        lookup = {str(key): value for key, value in zip(ids, values)}
+    else:
+        lookup = {
+            str(item.get("interaction_id")): item.get("ans_full")
+            for item in answers
+            if isinstance(item, dict)
+        }
+    for turn in turns:
+        interaction_id = str(turn.get("interaction_id", ""))
+        if not str(lookup.get(interaction_id, "") or "").strip():
+            return False, f"missing_answer:{interaction_id}"
+    return True, ""
+
+
+def _select_valid_conversations(dataset, requested: int):
+    """先过滤坏会话再截取数量，保证请求 5 组时尽量实际评测 5 组。"""
+    valid_indices, excluded = valid_conversation_indices(dataset, requested)
+    if excluded:
+        console.print(f"[yellow]已跳过 {len(excluded)} 个答案不完整会话：{excluded}[/yellow]")
+    return dataset.select(valid_indices)
+
+
 def main():
     parser = argparse.ArgumentParser(description="CRAG-MM 本地评测 UI 后端")
     parser.add_argument("--task", choices=["task1", "task2", "task3"], default="task1")
@@ -289,8 +323,20 @@ def main():
     selected = dataset[split]
     num_conversations = min(args.num_conversations, len(selected))
     if num_conversations >= 0:
-        selected = selected.select(range(num_conversations))
+        if args.task == "task3":
+            selected = _select_valid_conversations(selected, num_conversations)
+        else:
+            selected = selected.select(range(num_conversations))
         num_conversations = len(selected)
+
+    # 每次运行使用独立日志文件，避免旧 run 追加后被误当成同一批结果。
+    run_id = f"{int(time.time())}_{os.getpid()}"
+    trace_dir = ROOT_DIR / "UI" / "outputs" / args.task
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / f"trace_{run_id}.jsonl"
+    os.environ[f"{args.task.upper()}_DEBUG_PATH"] = str(trace_path)
+    if args.task in {"task2", "task3"}:
+        os.environ["TASK1_DEBUG_PATH"] = str(trace_path)
 
     search_pipeline = build_search_pipeline(args.task)
     if args.agent == "task1kg":

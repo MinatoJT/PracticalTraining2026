@@ -76,6 +76,11 @@ class Task2Agent(Task1KGAgent):
         images: List[Image.Image],
         message_histories: List[List[Dict[str, Any]]],
     ) -> List[str]:
+        if not (len(queries) == len(images) == len(message_histories)):
+            raise ValueError(
+                "Task2 批量输入长度不一致："
+                f"queries={len(queries)}, images={len(images)}, histories={len(message_histories)}"
+            )
         responses = []
 
         for query, image, history in zip(queries, images, message_histories):
@@ -90,15 +95,17 @@ class Task2Agent(Task1KGAgent):
             # 实体查询负责补齐图片主体的具体属性；合并后再统一过滤。
             broad_query = self._clean_query_text(query)
             web_query = self._build_web_query(query, initial_entity, initial_support or ranked_kg)
-            raw_web_results = self._merge_web_results(
-                self._web_search(broad_query),
+            broad_web = self._build_web_evidence(self._web_search(broad_query), source="broad")
+            entity_web = self._build_web_evidence(
                 self._web_search(web_query) if web_query.lower() != broad_query.lower() else [],
+                source="entity_directed",
             )
-            web_evidence = self._build_web_evidence(raw_web_results)
+            web_evidence = self._merge_web_results(broad_web, entity_web)
 
             # 3. 让网页标题和片段反向给 KG 候选投票，再调用已有的 LLM 实体选择接口。
             # 这样不会再把规则 top1 直接当成最终图片实体。
-            ranked_kg = self._rerank_kg_with_web(ranked_kg, web_evidence)
+            # 只有不含候选实体名的宽泛检索可为 KG 投票，避免错误实体通过搜索词自我强化。
+            ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
             support_entities = self._select_supporting_entities(query, ranked_kg)
             selected_entity = self._select_entity(query, support_entities or ranked_kg)
 
@@ -127,7 +134,18 @@ class Task2Agent(Task1KGAgent):
                 "web_query": web_query,
                 "broad_query": broad_query,
                 "web_count": len(web_evidence),
+                "broad_web_count": len(broad_web),
+                "entity_web_count": len(entity_web),
                 "support_entities": [item.get("entity_name") for item in support_entities],
+                "kg_score_components": [
+                    {
+                        "entity": item.get("entity_name"),
+                        "image_score": item.get("score"),
+                        "web_support_score": item.get("web_support_score", 0.0),
+                        "final_score": item.get("rule_score"),
+                    }
+                    for item in ranked_kg[: self.rerank_top_n]
+                ],
                 "ranked_web_titles": [item.get("title") for item in ranked_web[: self.web_keep_top_n]],
                 "has_client": self.client is not None,
             })
@@ -224,7 +242,11 @@ class Task2Agent(Task1KGAgent):
                 merged.append(item)
         return merged
 
-    def _build_web_evidence(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_web_evidence(
+        self,
+        results: List[Dict[str, Any]],
+        source: str = "web",
+    ) -> List[Dict[str, Any]]:
         """
         将网页检索原始结果整理成统一格式。
         兼容常见字段：
@@ -270,7 +292,7 @@ class Task2Agent(Task1KGAgent):
             seen.add(key)
 
             evidence.append({
-                "source": "web",
+                "source": source,
                 "rank": idx + 1,
                 "score": round(raw_score, 4),
                 "title": title,
@@ -448,9 +470,8 @@ class Task2Agent(Task1KGAgent):
         # Task2 回答接口：把多个 KG 候选和多个 Web 片段一起交给 DeepSeek，
         # 并复用 Task1 的完整句质量闸门，避免输出 top1 实体名或短语。
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self._build_task2_answer_messages(
+            answer = self._call_llm(
+                self._build_task2_answer_messages_clean(
                     query=query,
                     selected_entity=selected_entity,
                     kg_candidates=kg_candidates,
@@ -458,20 +479,22 @@ class Task2Agent(Task1KGAgent):
                     fused_context=fused_context,
                     history=history,
                 ),
-                temperature=0.0,
-                max_tokens=130,
+                max_tokens=512,
+                purpose="task2_answer",
             )
-
-            answer = response.choices[0].message.content or ""
             raw_answer = answer
+            quality_branches = []
 
             if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                quality_branches.append("llm_rewrite")
                 answer = self._rewrite_task2_as_sentence(query, answer, kg_candidates, web_evidence, history) or answer
 
             if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                quality_branches.append("heuristic_fallback")
                 answer = self._answer_with_heuristic_sentence(query, kg_candidates) or answer
 
             if self._needs_sentence_rewrite(answer, query, kg_candidates):
+                quality_branches.append("forced_idk")
                 answer = "I don't know."
 
             self._debug_task2({
@@ -482,6 +505,14 @@ class Task2Agent(Task1KGAgent):
                 "web_titles": [item.get("title") for item in web_evidence[: self.web_keep_top_n]],
                 "raw_answer": raw_answer[:260],
                 "answer": answer[:260],
+                "quality_branches": quality_branches,
+                "is_idk": "i don't know" in answer.lower(),
+                "idk_reason": (
+                    "empty_llm_content" if not raw_answer.strip()
+                    else "llm_returned_idk" if "i don't know" in raw_answer.lower()
+                    else "quality_gate" if "forced_idk" in quality_branches
+                    else ""
+                ),
             })
             return answer
 
@@ -527,6 +558,35 @@ class Task2Agent(Task1KGAgent):
             "请综合 KG 与 Web，直接输出最终答案。答案必须是完整英文句子，不能只输出单个实体名或短语。"
         )
 
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def _build_task2_answer_messages_clean(
+        self,
+        query: str,
+        selected_entity: Optional[Dict[str, Any]],
+        kg_candidates: List[Dict[str, Any]],
+        web_evidence: List[Dict[str, Any]],
+        fused_context: Dict[str, Any],
+        history: List[Dict[str, Any]],
+    ) -> List[Dict[str, str]]:
+        """构造 UTF-8 中文 Task2 Prompt，明确区分视觉实体与网页补充证据。"""
+        selected_name = selected_entity.get("entity_name", "") if selected_entity else "未确定"
+        selected_score = selected_entity.get("rule_score", 0.0) if selected_entity else 0.0
+        system = (
+            "你是 CRAG-MM Task2 多源增强问答助手。先判断图片主体，再回答用户问题。"
+            "Image-KG 是图片主体候选，网页证据只用于验证主体或补充属性；实体定向网页可能继承错误候选，不能单独证明主体。"
+            "不要盲信 top1，也不要把候选实体名列表当答案。若问题询问人物、地点、时间、数量、原因、用途、颜色或判断，必须回答对应属性。"
+            "仅当所有证据都无法支持答案时回答 I don't know. 英文问题使用英文完整句回答，最多两句。"
+            "不得提及 KG、候选、网页、检索或推理过程。"
+        )
+        user = (
+            f"用户问题：{query}\n\n"
+            f"当前暂定视觉实体：{selected_name}（综合分 {selected_score}，可能有误）\n\n"
+            f"Image-KG 候选：\n{self._format_kg_candidates(kg_candidates[:self.rerank_top_n])}\n\n"
+            f"网页补充证据：\n{self._format_web_evidence(web_evidence[:self.web_keep_top_n])}\n\n"
+            f"历史上下文：\n{self._format_history(history)}\n\n"
+            "请直接输出回答问题本身的完整英文句子。"
+        )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     def _needs_sentence_rewrite(
@@ -575,9 +635,8 @@ class Task2Agent(Task1KGAgent):
         kg_text = self._format_kg_candidates(kg_candidates[: self.rerank_top_n])
         web_text = self._format_web_evidence(web_evidence[: self.web_keep_top_n])
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
+            rewritten = self._call_llm(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -597,10 +656,9 @@ class Task2Agent(Task1KGAgent):
                         ),
                     },
                 ],
-                temperature=0.0,
-                max_tokens=130,
+                max_tokens=192,
+                purpose="task2_sentence_rewrite",
             )
-            rewritten = response.choices[0].message.content or ""
             self._debug_task2({"event": "task2_sentence_rewrite", "query": query, "bad_answer": bad_answer[:160], "rewritten": rewritten[:220]})
             return rewritten
         except Exception as exc:
@@ -617,7 +675,8 @@ class Task2Agent(Task1KGAgent):
 
         rows = []
         for key, value in list(attrs.items())[:limit]:
-            rows.append(f"- {key}: {value}")
+            clean_value = re.sub(r"\s+", " ", str(value)).strip()[:300]
+            rows.append(f"- {key}: {clean_value}")
         return "\n".join(rows)
 
     def _format_kg_candidates(self, kg_candidates: List[Dict[str, Any]]) -> str:
@@ -644,8 +703,9 @@ class Task2Agent(Task1KGAgent):
         for idx, item in enumerate(web_evidence, start=1):
             rows.append(
                 f"{idx}. title={item.get('title', '')}; "
+                f"source={item.get('source', 'web')}; "
                 f"score={item.get('web_rule_score', item.get('score', 0.0))}; "
-                f"snippet={item.get('snippet', '')}"
+                f"snippet={str(item.get('snippet', ''))[:500]}"
             )
         return "\n".join(rows)
 

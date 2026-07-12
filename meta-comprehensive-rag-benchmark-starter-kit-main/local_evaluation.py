@@ -222,6 +222,14 @@ class CRAGEvaluator:
             queries = batch["queries"]
             images = batch["images"]
             conversation_histories = batch["conversation_histories"]
+            lengths = {
+                "interaction_ids": len(interaction_ids),
+                "queries": len(queries),
+                "images": len(images),
+                "conversation_histories": len(conversation_histories),
+            }
+            if len(set(lengths.values())) != 1:
+                raise ValueError(f"评测批次输入长度不一致：{lengths}")
 
             message_histories = []
             interaction_id_histories = []
@@ -244,7 +252,23 @@ class CRAGEvaluator:
                 interaction_id_histories.append(interaction_id_history)
 
             # Generate responses for the current batch
+            trace_contexts = [
+                {
+                    "session_id": batch["session_ids"][idx],
+                    "interaction_id": interaction_id,
+                    "turn_idx": batch["turn_idxs"][idx],
+                    "total_turn_count": batch["total_turn_counts"][idx],
+                }
+                for idx, interaction_id in enumerate(interaction_ids)
+            ]
+            if hasattr(self.agent, "set_trace_contexts"):
+                self.agent.set_trace_contexts(trace_contexts)
             agent_responses = self.agent.batch_generate_response(queries, images, message_histories)
+            if len(agent_responses) != len(interaction_ids):
+                raise ValueError(
+                    "Agent 返回数量与输入不一致："
+                    f"responses={len(agent_responses)}, inputs={len(interaction_ids)}"
+                )
             agent_responses = self.truncate_agent_responses(agent_responses) # Truncase each response to the maximum allowed length (75 tokens)
             
             # Collect responses and add evaluation data
