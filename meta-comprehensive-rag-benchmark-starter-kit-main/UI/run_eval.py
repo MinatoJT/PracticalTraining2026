@@ -335,6 +335,7 @@ def main():
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / f"trace_{run_id}.jsonl"
     os.environ[f"{args.task.upper()}_DEBUG_PATH"] = str(trace_path)
+    os.environ["VISION_DEBUG_PATH"] = str(trace_path)
     if args.task in {"task2", "task3"}:
         os.environ["TASK1_DEBUG_PATH"] = str(trace_path)
 
@@ -372,12 +373,20 @@ def main():
         is_multi_turn=(dataset_type == "multi-turn"),
     )
 
+    visual_stats = {}
+    visual_pipeline = getattr(agent, "visual_pipeline", None)
+    if visual_pipeline is not None and hasattr(visual_pipeline, "stats"):
+        visual_stats = visual_pipeline.stats()
+        console.print("[bold cyan]视觉链路统计:[/bold cyan] " + json.dumps(visual_stats, ensure_ascii=False))
+
     output_dir = ROOT_DIR / "UI" / "outputs" / args.task
     output_dir.mkdir(parents=True, exist_ok=True)
     turn_results["all"].to_csv(output_dir / "turn_evaluation_results_all.csv", index=False)
     turn_results["ego"].to_csv(output_dir / "turn_evaluation_results_ego.csv", index=False)
     with open(output_dir / "scores_dictionary.json", "w", encoding="utf-8") as f:
         json.dump(score_dicts, f, indent=2)
+    with open(output_dir / "vision_stats.json", "w", encoding="utf-8") as f:
+        json.dump(visual_stats, f, ensure_ascii=False, indent=2)
     console.print(f"[bold green]结果已保存到:[/bold green] {output_dir}")
 
 

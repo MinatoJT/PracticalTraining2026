@@ -3,6 +3,24 @@
 
 # [Meta CRAG-MM: Comprehensive RAG Benchmark for Multi-Modal, Multi-Turn Dialogue Challenge](https://www.aicrowd.com/challenges/meta-crag-mm-challenge-2025)
 
+## DashScope Qwen3-VL visual reranking
+
+Task1/2/3 share the Alibaba Cloud DashScope `qwen3-vl-flash` OpenAI-compatible API. Qwen creates a structured visual anchor and reranks Image-KG candidates; DeepSeek still produces the final answer. If vision is disabled or the API fails, times out, or returns invalid JSON, the agents automatically use the legacy candidate ranking. No local model, WSL, or vLLM service is required.
+
+Configure the process before launching Qt/WinUI, or fill the separate Qwen fields in either UI:
+
+```powershell
+$env:VISION_ENABLED = "1"
+$env:QWEN_VL_API_KEY = "your DashScope key"
+$env:QWEN_VL_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:QWEN_VL_ANCHOR_MODEL = "qwen3.5-omni-plus"
+$env:QWEN_VL_RERANK_MODEL = "qwen3.5-omni-flash"
+$env:QWEN_VL_FALLBACK_MODEL = "qwen3-vl-flash"
+C:\anaconda\python.exe -B UI\check_vision_service.py
+```
+
+`QWEN_VL_API_KEY` takes priority over `DASHSCOPE_API_KEY`. `QWEN_VL_BASE_URL` may also point to a dedicated Beijing workspace endpoint. The default Plus + Flash configuration uses `qwen3.5-omni-plus` for visual anchors and `qwen3.5-omni-flash` for candidate reranking; `qwen3-vl-flash` is the compatibility fallback. The legacy `QWEN_VL_MODEL` variable remains supported and applies one model to both stages. Realtime models are rejected. Keys are passed only through environment variables and are never included in command previews or diagnostic logs. See `.env.example` for timeout, retries, cache, image-size, candidate-count and confidence settings.
+
 This repository is the **Submission template and Starter kit** for the Meta CRAG-MM challenge (KDD Cup 2025)! Clone the repository to compete now!
 
 **This repository contains**:

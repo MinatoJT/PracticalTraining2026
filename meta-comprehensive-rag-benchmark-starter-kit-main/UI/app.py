@@ -236,6 +236,33 @@ class MainWindow(QMainWindow):
         self.model_edit = QLineEdit(os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"))
         form.addRow("DeepSeek 模型", self.model_edit)
 
+        self.vision_enabled_check = QCheckBox("启用 Qwen3-VL 视觉增强")
+        self.vision_enabled_check.setChecked(os.environ.get("VISION_ENABLED", "0") == "1")
+        form.addRow("视觉模型", self.vision_enabled_check)
+
+        self.qwen_key_edit = QLineEdit()
+        self.qwen_key_edit.setEchoMode(QLineEdit.Password)
+        self.qwen_key_edit.setText(os.environ.get("QWEN_VL_API_KEY", os.environ.get("DASHSCOPE_API_KEY", "")))
+        self.qwen_key_edit.setPlaceholderText("百炼 Qwen VL API Key（不会写入命令预览）")
+        form.addRow("Qwen VL API Key", self.qwen_key_edit)
+
+        legacy_qwen_model = os.environ.get("QWEN_VL_MODEL", "").strip()
+        self.qwen_anchor_model_edit = QLineEdit(os.environ.get(
+            "QWEN_VL_ANCHOR_MODEL", legacy_qwen_model or "qwen3.5-omni-plus"
+        ))
+        form.addRow("视觉锚点模型", self.qwen_anchor_model_edit)
+
+        self.qwen_rerank_model_edit = QLineEdit(os.environ.get(
+            "QWEN_VL_RERANK_MODEL", legacy_qwen_model or "qwen3.5-omni-flash"
+        ))
+        form.addRow("候选重排模型", self.qwen_rerank_model_edit)
+
+        self.qwen_base_url_edit = QLineEdit(os.environ.get(
+            "QWEN_VL_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ))
+        form.addRow("Qwen VL Base URL", self.qwen_base_url_edit)
+
         self.revision_edit = QLineEdit("v0.1.2")
         form.addRow("数据集版本", self.revision_edit)
 
@@ -299,6 +326,10 @@ class MainWindow(QMainWindow):
             self.image_edit,
             self.question_edit,
             self.model_edit,
+            self.vision_enabled_check,
+            self.qwen_anchor_model_edit,
+            self.qwen_rerank_model_edit,
+            self.qwen_base_url_edit,
             self.revision_edit,
             self.no_progress_check,
         ]:
@@ -387,6 +418,24 @@ class MainWindow(QMainWindow):
         model = self.model_edit.text().strip()
         if model:
             env["DEEPSEEK_MODEL"] = model
+        env["VISION_ENABLED"] = "1" if self.vision_enabled_check.isChecked() else "0"
+        qwen_key = self.qwen_key_edit.text().strip()
+        if qwen_key:
+            env["QWEN_VL_API_KEY"] = qwen_key
+        qwen_anchor_model = self.qwen_anchor_model_edit.text().strip()
+        qwen_rerank_model = self.qwen_rerank_model_edit.text().strip()
+        if "-realtime" in qwen_anchor_model.lower() or "-realtime" in qwen_rerank_model.lower():
+            raise ValueError("realtime_model_not_supported")
+        if qwen_anchor_model:
+            env["QWEN_VL_ANCHOR_MODEL"] = qwen_anchor_model
+        if qwen_rerank_model:
+            env["QWEN_VL_RERANK_MODEL"] = qwen_rerank_model
+        env["QWEN_VL_FALLBACK_MODEL"] = os.environ.get("QWEN_VL_FALLBACK_MODEL", "qwen3-vl-flash")
+        qwen_base_url = self.qwen_base_url_edit.text().strip()
+        if qwen_base_url:
+            env["QWEN_VL_BASE_URL"] = qwen_base_url
+        env["QWEN_VL_PROVIDER"] = "dashscope"
+        env["QWEN_VL_ENABLE_THINKING"] = "0"
         dataset_dir = ROOT_DIR / "Dataset"
         dataset_dir.mkdir(exist_ok=True)
         env["PYTHONUTF8"] = "1"
@@ -417,9 +466,14 @@ class MainWindow(QMainWindow):
                 return
         self.output.clear()
         self._clear_live_conversations()
+        try:
+            child_env = self._build_env()
+        except ValueError as exc:
+            self.output.setPlainText(str(exc) + "\n")
+            return
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.worker = EvalWorker(self._build_command(), self._build_env())
+        self.worker = EvalWorker(self._build_command(), child_env)
         self.worker.output.connect(self.output.insertPlainText)
         self.worker.live_event.connect(self._append_live_event)
         self.worker.finished_with_code.connect(self._finished)

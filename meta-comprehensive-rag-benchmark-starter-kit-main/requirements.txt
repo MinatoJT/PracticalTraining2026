@@ -28,6 +28,7 @@ tokenizers
 
 # API integrations
 openai
+# Qwen3-VL 通过百炼 OpenAI-compatible API 接入，不需要本地 vLLM 或 WSL。
 cragmm-search-pipeline>=0.5.0
 chromadb>=1.0.0
 

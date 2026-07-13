@@ -83,13 +83,17 @@ class Task2Agent(Task1KGAgent):
             )
         responses = []
 
-        for query, image, history in zip(queries, images, message_histories):
+        for batch_index, (query, image, history) in enumerate(zip(queries, images, message_histories)):
             # 1. 复用 Task1：图像检索 KG，并使用 Task1 已修复的多候选阈值策略。
             raw_image_results = self._image_search(image)
             kg_evidence = self._build_evidence(raw_image_results)
-            ranked_kg = self._rank_candidates_by_rules(query, kg_evidence)
+            legacy_ranked = self._rank_candidates_by_rules(query, kg_evidence)
+            visual_result = self._prepare_visual_evidence(
+                query, image, history, legacy_ranked, trace=self._trace_context(batch_index)
+            )
+            ranked_kg = visual_result["candidates"]
             initial_support = self._select_supporting_entities(query, ranked_kg)
-            initial_entity = initial_support[0] if initial_support else (ranked_kg[0] if ranked_kg else None)
+            initial_entity = visual_result.get("selected_entity") or (initial_support[0] if initial_support else (ranked_kg[0] if ranked_kg else None))
 
             # 2. 同时执行宽查询和实体查询。宽查询负责在 KG top1 错误时召回正确网页，
             # 实体查询负责补齐图片主体的具体属性；合并后再统一过滤。
@@ -105,9 +109,10 @@ class Task2Agent(Task1KGAgent):
             # 3. 让网页标题和片段反向给 KG 候选投票，再调用已有的 LLM 实体选择接口。
             # 这样不会再把规则 top1 直接当成最终图片实体。
             # 只有不含候选实体名的宽泛检索可为 KG 投票，避免错误实体通过搜索词自我强化。
-            ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
+            if visual_result.get("fallback_used"):
+                ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
             support_entities = self._select_supporting_entities(query, ranked_kg)
-            selected_entity = self._select_entity(query, support_entities or ranked_kg)
+            selected_entity = visual_result.get("selected_entity") or self._select_entity(query, support_entities or ranked_kg)
 
             # 4. Task2 新增：网页证据过滤、排序、保留 top N。
             ranked_web = self._rank_web_evidence(
@@ -130,6 +135,9 @@ class Task2Agent(Task1KGAgent):
                 "event": "task2_query",
                 "query": query,
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
+                "visual_anchor": visual_result.get("anchor", {}),
+                "vision_fallback": visual_result.get("fallback_used"),
+                "vision_fallback_reason": visual_result.get("fallback_reason"),
                 "kg_count": len(kg_evidence),
                 "web_query": web_query,
                 "broad_query": broad_query,
@@ -187,6 +195,9 @@ class Task2Agent(Task1KGAgent):
 
         if selected_entity and selected_entity.get("entity_name"):
             parts.append(str(selected_entity["entity_name"]))
+            anchor_queries = (selected_entity.get("visual_anchor") or {}).get("retrieval_queries", [])
+            if anchor_queries:
+                parts.append(str(anchor_queries[0]))
         else:
             names = [
                 item.get("entity_name", "")
@@ -691,6 +702,9 @@ class Task2Agent(Task1KGAgent):
                 f"{idx}. entity={item.get('entity_name', '')}; "
                 f"image_score={item.get('score', 0.0)}; "
                 f"rule_score={item.get('rule_score', 0.0)}; "
+                f"qwen_score={item.get('qwen_final_score', 'N/A')}; "
+                f"sources={item.get('sources', [item.get('source', 'image_kg')])}; "
+                f"visual_target={(item.get('visual_anchor') or {}).get('question_target', '')}; "
                 f"attributes={attrs}"
             )
         return "\n".join(rows)

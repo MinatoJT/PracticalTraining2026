@@ -15,6 +15,17 @@
 - 每次 UI 运行写入独立的 `UI/outputs/<task>/trace_<run_id>.jsonl`。日志包含空回答分类、IDK 原因、质量分支、视觉锚点和 KG 分数组成。
 - `testTask23Diagnostics.py`: 不联网回归测试，覆盖 reasoning-only、length、空 choices、Web 投票隔离、视觉锚点建立与纠错、短问题判断、合法短答案、批量长度和有效会话选择。
 
+## Qwen3-VL Visual Candidate Pipeline (2026-07-13)
+
+- `agents/vision/qwen_vl_client.py`: 共享百炼 OpenAI-compatible 客户端，默认以 `qwen3.5-omni-plus` 生成视觉锚点、以 `qwen3.5-omni-flash` 重排候选，并以 `qwen3-vl-flash` 作一次模型级 fallback。Omni 请求不发送 `enable_thinking`，VL Flash 才按能力发送 `enable_thinking=false`；全部使用 JSON Mode，realtime 模型会被明确拒绝。API Key 优先读取 `QWEN_VL_API_KEY`，其次读取 `DASHSCOPE_API_KEY`，并清理引号和首尾空白，不记录 Key 或图片 base64。
+- `agents/vision/visual_anchor.py`: 提取代码块或额外文字中的首个 JSON 对象，校验 anchor/rerank 字段、置信度和候选索引；非法结果返回明确错误。
+- `agents/vision/visual_candidate_pipeline.py`: 合并 Image-KG 与 Qwen anchor 候选，Qwen 成功时以 `final_score` 为主排序，图像相似度只作 tie-breaker；Qwen 不可用、低置信或解析失败时完整回退旧逻辑。
+- `Task1KGAgent._prepare_visual_evidence(...)`: Task1/2/3 共用入口。Task1 不新增文本或 Web 检索；Task2/3 保留 broad/entity Web 分流，并禁止定向 Web 覆盖高置信 Qwen 视觉判断。
+- Task3 每轮均根据当前问题和必要用户历史生成问题相关 anchor，并以图片、当前问题和候选重新调用 Qwen 重排；完全相同请求由缓存去重，旧 assistant 回答只作为弱历史。
+- Qwen 只负责视觉主体、OCR 与候选验证，DeepSeek 继续负责最终答案和质量门，evaluator 的官方接口无变化。
+- 视觉链路默认直接调用百炼 API，不依赖 WSL、vLLM、本地模型或 `localhost:8000`。Qt 与 WinUI 均提供独立的锚点/重排模型字段，并通过密码框和环境变量传递 Qwen Key 及 Base URL，命令预览不包含 Key。旧 `QWEN_VL_MODEL` 仍可令两个阶段使用同一模型。
+- `testQwenVision.py`: 离线测试视觉关闭回退、画中画、OCR、错误 JSON、空响应/超时、Qwen 主排序、同图缓存及日志脱敏。
+
 ## Task1KGAgent
 
 新增 `agents/Task1KGAgent.py`，用于 Task1 单源增强：

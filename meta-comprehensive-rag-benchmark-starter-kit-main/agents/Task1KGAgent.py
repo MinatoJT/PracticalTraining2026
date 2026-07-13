@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from PIL import Image
 
 from agents.base_agent import BaseAgent
+from agents.vision import VisualCandidatePipeline
 from cragmm_search.search import UnifiedSearchPipeline
 
 
@@ -39,6 +40,8 @@ class Task1KGAgent(BaseAgent):
         self.deepseek_thinking = os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower()
         self.debug_path = os.getenv("TASK1_DEBUG_PATH")
         self._trace_contexts: List[Dict[str, Any]] = []
+        # Task2/Task3 通过继承共享同一个视觉客户端，不会重复加载或创建三份连接。
+        self.visual_pipeline = VisualCandidatePipeline()
         self.client = self._build_client()
         self._debug({"event": "init", "has_api_key": bool(self.api_key), "model": self.model_name, "has_client": self.client is not None})
 
@@ -67,15 +70,19 @@ class Task1KGAgent(BaseAgent):
                 f"queries={len(queries)}, images={len(images)}, histories={len(message_histories)}"
             )
         responses = []
-        for query, image, history in zip(queries, images, message_histories):
+        for batch_index, (query, image, history) in enumerate(zip(queries, images, message_histories)):
             # 1. 调用官方 Task1 图像检索 API，获得相似图像及其 KG 实体。
             raw_results = self._image_search(image)
             evidence = self._build_evidence(raw_results)
 
             # 2. 用规则分和阈值选出一组高置信 KG 候选，而不是只押注单个实体。
-            ranked_evidence = self._rank_candidates_by_rules(query, evidence)
+            legacy_ranked = self._rank_candidates_by_rules(query, evidence)
+            visual_result = self._prepare_visual_evidence(
+                query, image, history, legacy_ranked, trace=self._trace_context(batch_index)
+            )
+            ranked_evidence = visual_result["candidates"]
             support_entities = self._select_supporting_entities(query, ranked_evidence)
-            selected = support_entities[0] if support_entities else None
+            selected = visual_result.get("selected_entity") or (support_entities[0] if support_entities else None)
             self._debug({
                 "event": "query",
                 "query": query,
@@ -83,6 +90,8 @@ class Task1KGAgent(BaseAgent):
                 "ranked_entities": [item.get("entity_name") for item in ranked_evidence[:8]],
                 "support_entities": [item.get("entity_name") for item in support_entities],
                 "selected_entity": selected.get("entity_name") if selected else None,
+                "vision_fallback": visual_result.get("fallback_used"),
+                "vision_fallback_reason": visual_result.get("fallback_reason"),
                 "has_client": self.client is not None,
             })
 
@@ -93,6 +102,38 @@ class Task1KGAgent(BaseAgent):
                 answer = self._answer_with_rules(query, support_entities or ranked_evidence)
             responses.append(self._finalize_answer(answer))
         return responses
+
+    def _prepare_visual_evidence(
+        self,
+        query: str,
+        image: Image.Image,
+        history: List[Dict[str, Any]],
+        legacy_candidates: List[Dict[str, Any]],
+        cached_anchor: Optional[Dict[str, Any]] = None,
+        refresh_anchor: bool = True,
+        trace: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """三项任务共用的视觉入口；任何异常都返回旧候选，不让 evaluator 崩溃。"""
+        try:
+            return self.visual_pipeline.prepare(
+                query=query,
+                image=image,
+                history=history,
+                legacy_candidates=legacy_candidates,
+                cached_anchor=cached_anchor,
+                refresh_anchor=refresh_anchor,
+                trace=trace,
+            )
+        except Exception as exc:
+            self._debug({"event": "vision_pipeline_error", "query": query, "error": repr(exc)})
+            return {
+                "anchor": cached_anchor or {},
+                "candidates": legacy_candidates,
+                "selected_entity": legacy_candidates[0] if legacy_candidates else None,
+                "rerank": {},
+                "fallback_used": True,
+                "fallback_reason": "vision_pipeline_exception",
+            }
 
     def _build_client(self):
         # OpenAI SDK 兼容 DeepSeek API；未设置 key 时不初始化，避免测试脚本必须联网。
@@ -549,6 +590,8 @@ class Task1KGAgent(BaseAgent):
             rows.append(
                 f"{idx}. entity={item.get('entity_name', '')}; "
                 f"image_score={item.get('score', 0.0)}; rule_score={item.get('rule_score', 0.0)}; "
+                f"qwen_score={item.get('qwen_final_score', 'N/A')}; sources={item.get('sources', [item.get('source', 'image_kg')])}; "
+                f"visual_target={(item.get('visual_anchor') or {}).get('question_target', '')}; "
                 f"attributes={attr_text}"
             )
         return "\n".join(rows)

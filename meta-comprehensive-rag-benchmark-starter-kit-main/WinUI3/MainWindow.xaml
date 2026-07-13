@@ -32,6 +32,11 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <TextBlock Grid.Row="0" Text="Mode" VerticalAlignment="Center" />
@@ -87,8 +92,23 @@
                 <TextBlock Grid.Row="9" Text="DeepSeek model" VerticalAlignment="Center" />
                 <TextBox x:Name="DeepSeekModelBox" Grid.Row="9" Grid.Column="1" Text="deepseek-v4-flash" />
 
-                <TextBlock Grid.Row="10" Text="Dataset revision" VerticalAlignment="Center" />
-                <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal" Spacing="14">
+                <TextBlock Grid.Row="10" Text="Qwen VL vision" VerticalAlignment="Center" />
+                <CheckBox x:Name="VisionEnabledBox" Grid.Row="10" Grid.Column="1" Content="Enable Qwen3-VL visual enhancement" />
+
+                <TextBlock Grid.Row="11" Text="Qwen VL API Key" VerticalAlignment="Center" />
+                <PasswordBox x:Name="QwenApiKeyBox" Grid.Row="11" Grid.Column="1" PlaceholderText="DashScope key; never shown in command preview" />
+
+                <TextBlock Grid.Row="12" Text="Visual anchor model" VerticalAlignment="Center" />
+                <TextBox x:Name="QwenAnchorModelBox" Grid.Row="12" Grid.Column="1" Text="qwen3.5-omni-plus" />
+
+                <TextBlock Grid.Row="13" Text="Candidate rerank model" VerticalAlignment="Center" />
+                <TextBox x:Name="QwenRerankModelBox" Grid.Row="13" Grid.Column="1" Text="qwen3.5-omni-flash" />
+
+                <TextBlock Grid.Row="14" Text="Qwen VL Base URL" VerticalAlignment="Center" />
+                <TextBox x:Name="QwenBaseUrlBox" Grid.Row="14" Grid.Column="1" Text="https://dashscope.aliyuncs.com/compatible-mode/v1" />
+
+                <TextBlock Grid.Row="15" Text="Dataset revision" VerticalAlignment="Center" />
+                <StackPanel Grid.Row="15" Grid.Column="1" Orientation="Horizontal" Spacing="14">
                     <TextBox x:Name="RevisionBox" Text="v0.1.2" Width="220" />
                     <CheckBox x:Name="DisableProgressBox" Content="Disable progress bars" />
                 </StackPanel>

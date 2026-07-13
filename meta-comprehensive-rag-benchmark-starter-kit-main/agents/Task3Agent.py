@@ -128,10 +128,21 @@ class Task3Agent(Task2Agent):
                 # 普通知识追问沿用首轮视觉候选，避免每轮重搜造成主体漂移，也避免 KG 为空。
                 kg_evidence = [dict(item) for item in anchor.get("candidates", [])]
 
-            ranked_kg = self._rank_candidates_by_rules(contextual_query, kg_evidence)
-            ranked_kg = self._rerank_kg_with_context(ranked_kg, contextual_query, context)
+            legacy_ranked = self._rank_candidates_by_rules(contextual_query, kg_evidence)
+            legacy_ranked = self._rerank_kg_with_context(legacy_ranked, contextual_query, context)
+            visual_result = self._prepare_visual_evidence(
+                contextual_query,
+                image,
+                history,
+                legacy_ranked,
+                # 每轮问题的指向可能变化，按当前问题生成锚点；相同请求由视觉管线缓存去重。
+                cached_anchor=None,
+                refresh_anchor=True,
+                trace=trace,
+            )
+            ranked_kg = visual_result["candidates"]
             initial_support = self._select_supporting_entities(contextual_query, ranked_kg)
-            initial_entity = initial_support[0] if initial_support else (ranked_kg[0] if ranked_kg else None)
+            initial_entity = visual_result.get("selected_entity") or (initial_support[0] if initial_support else (ranked_kg[0] if ranked_kg else None))
 
             # 2. 多轮问题经常含有 it/that/this 等指代词，web query 使用改写后的独立问题。
             web_query = self._build_task3_web_query(contextual_query, context, initial_entity, initial_support or ranked_kg)
@@ -141,16 +152,18 @@ class Task3Agent(Task2Agent):
                 source="entity_directed",
             )
             web_evidence = self._merge_web_results(broad_web, entity_web)
-            ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
+            if visual_result.get("fallback_used"):
+                ranked_kg = self._rerank_kg_with_web(ranked_kg, broad_web)
             support_entities = self._select_supporting_entities(contextual_query, ranked_kg)
-            selected_entity = self._select_entity(contextual_query, support_entities or ranked_kg)
+            selected_entity = visual_result.get("selected_entity") or self._select_entity(contextual_query, support_entities or ranked_kg)
 
-            if use_image and session_id and selected_entity:
+            if session_id and selected_entity:
                 anchor = self._update_visual_anchor(
                     session_id,
                     selected_entity,
                     support_entities or ranked_kg,
                     trace.get("turn_idx"),
+                    visual_result.get("anchor", {}),
                 )
                 context["visual_anchor"] = anchor
             ranked_web = self._rank_web_evidence(
@@ -199,6 +212,10 @@ class Task3Agent(Task2Agent):
                 "use_image": use_image,
                 "selected_entity": selected_entity.get("entity_name") if selected_entity else None,
                 "anchor_entity": (anchor.get("selected_entity") or {}).get("entity_name") if anchor else None,
+                "qwen_anchor_subject": (visual_result.get("anchor") or {}).get("primary_subject"),
+                "qwen_confidence": (visual_result.get("rerank") or {}).get("confidence", 0.0),
+                "vision_fallback": visual_result.get("fallback_used"),
+                "vision_fallback_reason": visual_result.get("fallback_reason"),
                 "image_score": anchor.get("image_score") if anchor else None,
                 "image_margin": anchor.get("image_margin") if anchor else None,
                 "kg_count": len(kg_evidence),
@@ -227,6 +244,7 @@ class Task3Agent(Task2Agent):
         selected_entity: Dict[str, Any],
         candidates: List[Dict[str, Any]],
         turn_idx: Any,
+        qwen_anchor: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """写入或纠正会话视觉锚点；显式重新看图得到的新证据可以覆盖旧锚点。"""
         anchor_candidates = [dict(item) for item in candidates[: self.rerank_top_n]]
@@ -237,6 +255,7 @@ class Task3Agent(Task2Agent):
             "image_score": scores[0] if scores else 0.0,
             "image_margin": (scores[0] - scores[1]) if len(scores) > 1 else 0.0,
             "turn_idx": turn_idx,
+            "qwen_anchor": qwen_anchor or {},
         }
         self.visual_anchors[session_id] = anchor
         return anchor
@@ -500,6 +519,7 @@ class Task3Agent(Task2Agent):
         """构造 UTF-8 中文 Task3 Prompt，显式提供会话锚点并允许新证据纠错。"""
         anchor = context.get("visual_anchor", {}) or {}
         anchor_name = str((anchor.get("selected_entity") or {}).get("entity_name", "未确定"))
+        qwen_anchor = anchor.get("qwen_anchor", {}) or {}
         selected_name = selected_entity.get("entity_name", "未确定") if selected_entity else "未确定"
         system = (
             "你是 CRAG-MM Task3 多轮视觉问答助手。每一轮都必须回答当前问题，并保持同一会话中的图片主体一致。"
@@ -514,6 +534,9 @@ class Task3Agent(Task2Agent):
             f"当前问题：{original_query}\n"
             f"用于检索的上下文问题：{contextual_query}\n\n"
             f"会话视觉锚点：{anchor_name}\n"
+            f"Qwen 当前问题目标：{qwen_anchor.get('question_target', '未确定')}\n"
+            f"Qwen 图片主体：{qwen_anchor.get('primary_subject', '未确定')}\n"
+            f"Qwen 可见文字：{qwen_anchor.get('visible_text', [])}\n"
             f"本轮暂定实体：{selected_name}\n\n"
             f"视觉候选与属性：\n{self._format_kg_candidates(kg_candidates[:self.rerank_top_n])}\n\n"
             f"网页补充证据：\n{self._format_web_evidence(web_evidence[:self.web_keep_top_n])}\n\n"

@@ -31,6 +31,11 @@ public sealed partial class MainWindow : Window
         QuestionBox.TextChanged += (_, _) => UpdateCommandPreview();
         ApiKeyBox.PasswordChanged += (_, _) => UpdateCommandPreview();
         DeepSeekModelBox.TextChanged += (_, _) => UpdateCommandPreview();
+        VisionEnabledBox.Checked += (_, _) => UpdateCommandPreview();
+        VisionEnabledBox.Unchecked += (_, _) => UpdateCommandPreview();
+        QwenAnchorModelBox.TextChanged += (_, _) => UpdateCommandPreview();
+        QwenRerankModelBox.TextChanged += (_, _) => UpdateCommandPreview();
+        QwenBaseUrlBox.TextChanged += (_, _) => UpdateCommandPreview();
         RevisionBox.TextChanged += (_, _) => UpdateCommandPreview();
         DisableProgressBox.Checked += (_, _) => UpdateCommandPreview();
         DisableProgressBox.Unchecked += (_, _) => UpdateCommandPreview();
@@ -121,6 +126,13 @@ public sealed partial class MainWindow : Window
         var command = BuildCommand();
         if (command is null)
         {
+            return;
+        }
+
+        if (QwenAnchorModelBox.Text.Contains("-realtime", StringComparison.OrdinalIgnoreCase)
+            || QwenRerankModelBox.Text.Contains("-realtime", StringComparison.OrdinalIgnoreCase))
+        {
+            AppendOutput("realtime_model_not_supported" + Environment.NewLine);
             return;
         }
 
@@ -284,6 +296,27 @@ public sealed partial class MainWindow : Window
         if (!string.IsNullOrWhiteSpace(DeepSeekModelBox.Text))
         {
             env["DEEPSEEK_MODEL"] = DeepSeekModelBox.Text.Trim();
+        }
+
+        env["VISION_ENABLED"] = VisionEnabledBox.IsChecked == true ? "1" : "0";
+        env["QWEN_VL_PROVIDER"] = "dashscope";
+        env["QWEN_VL_ENABLE_THINKING"] = "0";
+        if (!string.IsNullOrWhiteSpace(QwenApiKeyBox.Password))
+        {
+            env["QWEN_VL_API_KEY"] = QwenApiKeyBox.Password.Trim();
+        }
+        if (!string.IsNullOrWhiteSpace(QwenAnchorModelBox.Text))
+        {
+            env["QWEN_VL_ANCHOR_MODEL"] = QwenAnchorModelBox.Text.Trim();
+        }
+        if (!string.IsNullOrWhiteSpace(QwenRerankModelBox.Text))
+        {
+            env["QWEN_VL_RERANK_MODEL"] = QwenRerankModelBox.Text.Trim();
+        }
+        env["QWEN_VL_FALLBACK_MODEL"] = Environment.GetEnvironmentVariable("QWEN_VL_FALLBACK_MODEL") ?? "qwen3-vl-flash";
+        if (!string.IsNullOrWhiteSpace(QwenBaseUrlBox.Text))
+        {
+            env["QWEN_VL_BASE_URL"] = QwenBaseUrlBox.Text.Trim();
         }
 
         return env;
