@@ -192,12 +192,9 @@ class MainWindow(QMainWindow):
         form.addRow("任务", self.task_combo)
 
         self.agent_combo = QComboBox()
-        self.agent_combo.addItem("Task1KGAgent（newagents：Qwen + DeepSeek）", "task1kg")
-        self.agent_combo.addItem("Task2Agent（newagents：Qwen + DeepSeek）", "task2agent")
-        self.agent_combo.addItem("Task3Agent（newagents：Qwen + DeepSeek）", "task3agent")
-        self.agent_combo.addItem("Legacy Task1KGAgent", "legacy_task1kg")
-        self.agent_combo.addItem("Legacy Task2Agent", "legacy_task2agent")
-        self.agent_combo.addItem("Legacy Task3Agent", "legacy_task3agent")
+        self.agent_combo.addItem("Task1KGAgent（Task1 知识图谱）", "task1kg")
+        self.agent_combo.addItem("Task2Agent（Task2 多源增强）", "task2agent")
+        self.agent_combo.addItem("Task3Agent（Task3 上下文优化）", "task3agent")
         self.agent_combo.addItem("项目 user_config.UserAgent", "user_config")
         form.addRow("智能体", self.agent_combo)
 
@@ -251,12 +248,12 @@ class MainWindow(QMainWindow):
 
         legacy_qwen_model = os.environ.get("QWEN_VL_MODEL", "").strip()
         self.qwen_anchor_model_edit = QLineEdit(os.environ.get(
-            "QWEN_VL_ANCHOR_MODEL", legacy_qwen_model or "qwen3.5-omni-plus-2026-03-15"
+            "QWEN_VL_ANCHOR_MODEL", legacy_qwen_model or "qwen3.5-omni-plus"
         ))
         form.addRow("视觉锚点模型", self.qwen_anchor_model_edit)
 
         self.qwen_rerank_model_edit = QLineEdit(os.environ.get(
-            "QWEN_VL_RERANK_MODEL", legacy_qwen_model or "qwen3-omni-flash-2025-12-01"
+            "QWEN_VL_RERANK_MODEL", legacy_qwen_model or "qwen3.5-omni-flash"
         ))
         form.addRow("候选重排模型", self.qwen_rerank_model_edit)
 
@@ -369,7 +366,6 @@ class MainWindow(QMainWindow):
         self.question_edit.setEnabled(custom)
         if custom:
             self.task_combo.setCurrentIndex(0)
-            # 自定义 Task1 与评测模式共用 newagents.Task1KGAgent。
             self.agent_combo.setCurrentIndex(0)
         self._update_command_preview()
 
@@ -422,12 +418,7 @@ class MainWindow(QMainWindow):
         model = self.model_edit.text().strip()
         if model:
             env["DEEPSEEK_MODEL"] = model
-        selected_agent = self.agent_combo.currentData()
-        # newagents 的视觉规划和重排均依赖 Qwen；对应选项下强制标记为启用。
-        env["VISION_ENABLED"] = "1" if (
-            self.vision_enabled_check.isChecked()
-            or str(selected_agent) in {"task1kg", "task2agent", "task3agent"}
-        ) else "0"
+        env["VISION_ENABLED"] = "1" if self.vision_enabled_check.isChecked() else "0"
         qwen_key = self.qwen_key_edit.text().strip()
         if qwen_key:
             env["QWEN_VL_API_KEY"] = qwen_key

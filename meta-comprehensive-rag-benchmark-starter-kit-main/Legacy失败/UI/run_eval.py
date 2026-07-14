@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 from conversation_validation import valid_conversation_indices
 from evaluation_utils import build_deepseek_judge_prompt, semantic_shortcut
+from fixed_sample_selection import select_fixed_conversations
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 DATASET_DIR = ROOT_DIR / "Dataset"
 DATASET_DIR.mkdir(exist_ok=True)
@@ -34,13 +36,12 @@ os.environ.setdefault("PANDAS_USE_BOTTLENECK", "0")
 from datasets import load_dataset
 from rich.console import Console
 
-from agents.Task1KGAgent import Task1KGAgent as LegacyTask1KGAgent
-from agents.Task2Agent import Task2Agent as LegacyTask2Agent
-from agents.Task3Agent import Task3Agent as LegacyTask3Agent
-from newagents import Task1KGAgent, Task2Agent, Task3Agent
+from agents.Task1KGAgent import Task1KGAgent
+from agents.Task2Agent import Task2Agent
+from agents.Task3Agent import Task3Agent
 import types
 _fake_user_config = types.ModuleType("agents.user_config")
-_fake_user_config.UserAgent = LegacyTask1KGAgent
+_fake_user_config.UserAgent = Task1KGAgent
 sys.modules["agents.user_config"] = _fake_user_config
 from cragmm_search.search import UnifiedSearchPipeline
 import local_evaluation
@@ -297,28 +298,56 @@ def _select_valid_conversations(dataset, requested: int):
     return dataset.select(valid_indices)
 
 
+def _safe_run_snapshot(args, agent, output_dir: Path, trace_path: Path, selected_ids: list[str]) -> None:
+    """Write reproducibility metadata without secret values."""
+    env_names = [
+        "VISION_ENABLED", "VISION_RERANK_ENABLED", "VISION_RERANK_MODE",
+        "VISION_ANCHOR_CACHE", "ANSWER_RELIABILITY_ENABLED",
+        "VISUAL_VERIFIER_ENABLED", "EVIDENCE_RETRY_ENABLED",
+        "QWEN_VL_ANCHOR_MODEL", "QWEN_VL_RERANK_MODEL", "DEEPSEEK_MODEL",
+    ]
+    key_names = ["DEEPSEEK_API_KEY", "QWEN_VL_API_KEY", "DASHSCOPE_API_KEY"]
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(ROOT_DIR.parent), "rev-parse", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "-C", str(ROOT_DIR.parent), "diff", "--stat"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        ).stdout.strip()
+    except Exception:
+        head, diff = "unavailable", "unavailable"
+    snapshot = {
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "head": head, "git_diff_stat": diff, "python_executable": sys.executable,
+        "agent_class": type(agent).__name__, "agent_file": sys.modules[type(agent).__module__].__file__,
+        "task_files": {
+            "Task1": sys.modules[Task1KGAgent.__module__].__file__,
+            "Task2": sys.modules[Task2Agent.__module__].__file__,
+            "Task3": sys.modules[Task3Agent.__module__].__file__,
+        },
+        "revision": args.revision, "eval_model": args.eval_model,
+        "environment": {name: os.environ.get(name, "") for name in env_names},
+        "secret_presence": {name: bool(os.environ.get(name)) for name in key_names},
+        "fixed_sample_ids": selected_ids, "trace_path": str(trace_path),
+    }
+    (output_dir / "config_snapshot.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    command = subprocess.list2cmdline([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    (output_dir / "run_command.txt").write_text(command + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description="CRAG-MM 本地评测 UI 后端")
     parser.add_argument("--task", choices=["task1", "task2", "task3"], default="task1")
-    parser.add_argument(
-        "--agent",
-        choices=[
-            "task1kg",
-            "task2agent",
-            "task3agent",
-            "legacy_task1kg",
-            "legacy_task2agent",
-            "legacy_task3agent",
-            "user_config",
-        ],
-        default="task1kg",
-    )
+    parser.add_argument("--agent", choices=["task1kg", "task2agent", "task3agent", "user_config"], default="task1kg")
     parser.add_argument("--num-conversations", type=int, default=20)
     parser.add_argument("--display-conversations", type=int, default=5)
     parser.add_argument("--eval-model", default="None")
     parser.add_argument("--revision", default="v0.1.2")
-    parser.add_argument("--sample-seed", type=int, default=None, help="Shuffle before selecting conversations")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--sample-ids-file", default="", help="Diagnostic-only file containing one interaction ID per line")
+    parser.add_argument("--output-dir", default="", help="Optional isolated output directory for controlled runs")
     args = parser.parse_args()
 
     ensure_crag_cache_dir_is_configured()
@@ -335,11 +364,14 @@ def main():
     dataset = load_dataset(repo_name, revision=args.revision)
     split = "validation" if "validation" in dataset else list(dataset.keys())[0]
     selected = dataset[split]
-    if args.sample_seed is not None:
-        selected = selected.shuffle(seed=args.sample_seed)
-        console.print(f"[bold blue]Sample seed:[/bold blue] {args.sample_seed}")
-    num_conversations = min(args.num_conversations, len(selected))
-    if num_conversations >= 0:
+    selected_ids = []
+    if args.sample_ids_file:
+        selected, selected_ids, fixed_path = select_fixed_conversations(selected, args.sample_ids_file)
+        console.print(f"[bold cyan]固定样本:[/bold cyan] {len(selected_ids)} IDs from {fixed_path}")
+        num_conversations = len(selected)
+    else:
+        num_conversations = min(args.num_conversations, len(selected))
+    if not args.sample_ids_file and num_conversations >= 0:
         if args.task == "task3":
             selected = _select_valid_conversations(selected, num_conversations)
         else:
@@ -348,14 +380,11 @@ def main():
 
     # 每次运行使用独立日志文件，避免旧 run 追加后被误当成同一批结果。
     run_id = f"{int(time.time())}_{os.getpid()}"
-    trace_dir = ROOT_DIR / "UI" / "outputs" / args.task
+    trace_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else ROOT_DIR / "UI" / "outputs" / args.task
     trace_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = trace_dir / f"trace_{run_id}.jsonl"
+    trace_path = trace_dir / ("trace.jsonl" if args.output_dir else f"trace_{run_id}.jsonl")
     os.environ[f"{args.task.upper()}_DEBUG_PATH"] = str(trace_path)
     os.environ["VISION_DEBUG_PATH"] = str(trace_path)
-    os.environ["NEWAGENTS_DEBUG_PATH"] = str(trace_path)
-    # newagents 使用独立的无敏感信息 JSONL 诊断变量，方便 UI 将本次运行完整归档。
-    os.environ["NEWAGENTS_DEBUG_PATH"] = str(trace_path)
     if args.task in {"task2", "task3"}:
         os.environ["TASK1_DEBUG_PATH"] = str(trace_path)
 
@@ -366,18 +395,13 @@ def main():
         agent_cls = Task2Agent
     elif args.agent == "task3agent":
         agent_cls = Task3Agent
-    elif args.agent == "legacy_task1kg":
-        agent_cls = LegacyTask1KGAgent
-    elif args.agent == "legacy_task2agent":
-        agent_cls = LegacyTask2Agent
-    elif args.agent == "legacy_task3agent":
-        agent_cls = LegacyTask3Agent
     else:
         import importlib
         sys.modules.pop("agents.user_config", None)
         ProjectUserAgent = importlib.import_module("agents.user_config").UserAgent
         agent_cls = ProjectUserAgent
     agent = agent_cls(search_pipeline=search_pipeline)
+    _safe_run_snapshot(args, agent, trace_dir, trace_path, selected_ids)
     install_live_event_stream(agent, args.task)
 
     evaluator = CRAGEvaluator(
@@ -405,9 +429,11 @@ def main():
         visual_stats = visual_pipeline.stats()
         console.print("[bold cyan]视觉链路统计:[/bold cyan] " + json.dumps(visual_stats, ensure_ascii=False))
 
-    output_dir = ROOT_DIR / "UI" / "outputs" / args.task
+    output_dir = trace_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     turn_results["all"].to_csv(output_dir / "turn_evaluation_results_all.csv", index=False)
+    if args.sample_ids_file:
+        turn_results["all"].to_csv(output_dir / "fixed_sample_results.csv", index=False)
     turn_results["ego"].to_csv(output_dir / "turn_evaluation_results_ego.csv", index=False)
     with open(output_dir / "scores_dictionary.json", "w", encoding="utf-8") as f:
         json.dump(score_dicts, f, indent=2)

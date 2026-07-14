@@ -13,13 +13,13 @@ C:\anaconda\python.exe UI\app.py
 
 ## 说明
 
-- Task1/Task2/Task3 默认分别使用 `newagents.Task1KGAgent`、`newagents.Task2Agent`、`newagents.Task3Agent`；旧实现仍可通过 `Legacy` 选项手动选择。
-- 新 Agent 使用 Qwen-VL API 做视觉规划与重排、DeepSeek API 做证据约束回答。Task1 仍禁用 web search。
+- Task1 默认使用 `Task1KGAgent`，并禁用 web search。
+- Task2/Task3 默认使用项目里的 `agents.user_config.UserAgent`，方便后续替换你的多源/多轮 agent。
 - 运行结果会保存到 `UI\outputs\<task>`。
 
 ## Custom Task1 question
 
-在 UI 的 Mode 中选择 Custom Task1 question，选择本地图片并输入问题，即可用 Task1 图像检索 API + `newagents.Task1KGAgent` 做单条问答。
+在 UI 的 Mode 中选择 Custom Task1 question，选择本地图片并输入问题，即可用 Task1 图像检索 API + Task1KGAgent 做单条问答。
 
 
 ## Dataset 缓存目录

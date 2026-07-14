@@ -25,9 +25,6 @@ dotnet run --project WinUI3\CRAGMM.WinUI.csproj --configuration Release
 
 UI 会自动查找项目根目录、优先使用项目 `.venv`，也支持通过 `CRAGMM_PYTHON` 指定 Python。
 
-任务切换时，UI 默认选择对应的 `BlackPearlTask1Agent`、`BlackPearlTask2Agent` 或
-`BlackPearlTask3Agent`（Qwen-VL API + DeepSeek API）；旧 Agent 仍保留在下拉框中可手动选择。
-
 
 ## 构建组件提示
 

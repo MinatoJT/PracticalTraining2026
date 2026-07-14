@@ -1,0 +1,48 @@
+# CRAG-MM 实训环境依赖
+# 建议在项目根目录执行：
+#   py -3.12 -m venv .venv
+#   .venv\Scripts\python -m pip install -U pip
+#   .venv\Scripts\pip install -r requirements.txt
+
+# File transfer and loading utilities
+hf_transfer
+hf_xet
+python-dotenv
+
+# Core ML frameworks
+# 默认安装 CPU 版 torch；如需 CUDA，请按 PyTorch 官网命令单独安装匹配版本。
+torch>=2.6,<2.7
+torchvision>=0.21.0
+transformers
+accelerate>=0.26.0
+sentence-transformers
+
+# Data processing and modeling
+numpy<2
+pandas
+pydantic
+datasets
+Pillow
+jinja2>=3.1.0
+tokenizers
+
+# API integrations
+openai
+# Qwen3-VL 通过百炼 OpenAI-compatible API 接入，不需要本地 vLLM 或 WSL。
+cragmm-search-pipeline>=0.5.0
+chromadb>=1.0.0
+
+# UI
+PySide6
+
+# Misc
+loguru
+rich
+tqdm
+# Native Windows dependencies for WinUI3 UI (not pip-installable):
+# Install with Visual Studio Installer / Build Tools 2022:
+#   Microsoft.VisualStudio.ComponentGroup.UWP.BuildTools
+#   Microsoft.VisualStudio.Component.Windows10SDK.19041
+#   Microsoft.VisualStudio.Component.Windows11SDK.26100
+# The WinUI3 launcher uses VS MSBuild, because dotnet build may look in the wrong SDK path for PRI tasks.
+# WinUI3 is configured with WindowsAppSDKSelfContained=true to avoid per-user Windows App Runtime registration issues.

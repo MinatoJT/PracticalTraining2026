@@ -1,7 +1,6 @@
 import os
 import urllib.parse
 import hashlib
-import time
 import requests
 from PIL import Image
 
@@ -93,49 +92,10 @@ def download_image_url(image_url):
                 print(f"Cached image is invalid, re-downloading: {local_path}")
                 # Continue with download as the cached file is invalid
         
-        # Public image hosts occasionally rate-limit benchmark bursts. Retry the
-        # identical URL so random evaluation batches stay reproducible.
-        headers = {
-            "User-Agent": "CRAG-MM-Evaluation/1.0 (contact: educational@example.invalid; image cache enabled)",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Referer": "https://commons.wikimedia.org/",
-        }
-        response = None
-        last_error = None
-        request_url = image_url
-        for attempt in range(4):
-            try:
-                response = requests.get(request_url, stream=True, timeout=20, headers=headers)
-                response.raise_for_status()
-                break
-            except requests.RequestException as exc:
-                last_error = exc
-                if response is not None:
-                    response.close()
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                parsed_url = urllib.parse.urlparse(image_url)
-                if (
-                    attempt == 0
-                    and status in {403, 429}
-                    and parsed_url.netloc.lower() == "upload.wikimedia.org"
-                ):
-                    filename = urllib.parse.unquote(parsed_url.path.rsplit("/", 1)[-1])
-                    request_url = (
-                        "https://commons.wikimedia.org/wiki/Special:Redirect/file/"
-                        + urllib.parse.quote(filename, safe="")
-                        + "?width=960"
-                    )
-                    continue
-                if status not in {408, 425, 429, 500, 502, 503, 504} or attempt == 3:
-                    raise
-                retry_after = getattr(exc.response, "headers", {}).get("Retry-After", "")
-                try:
-                    delay = min(20.0, max(1.0, float(retry_after)))
-                except (TypeError, ValueError):
-                    delay = float(2 ** (attempt + 1))
-                time.sleep(delay)
-        if response is None:
-            raise last_error or RuntimeError("image_download_failed")
+        # Download the image
+        headers = {"User-Agent": "CRAGBot/v0.0.1"}
+        response = requests.get(image_url, stream=True, timeout=10, headers=headers)
+        response.raise_for_status()
         
         # Save the image to a temporary file first
         temp_path = f"{local_path}.temp"

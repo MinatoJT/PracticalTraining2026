@@ -78,11 +78,6 @@ public sealed partial class MainWindow : Window
         ImagePathBox.IsEnabled = isCustom;
         BrowseButton.IsEnabled = isCustom;
         QuestionBox.IsEnabled = isCustom;
-        if (isCustom)
-        {
-            // 自定义 Task1 同样使用新的 API 流水线，保持两个 UI 的行为一致。
-            AgentCombo.SelectedIndex = 3;
-        }
         UpdateCommandPreview();
     }
 
@@ -91,15 +86,15 @@ public sealed partial class MainWindow : Window
         var task = SelectedTag(TaskCombo);
         if (task == "task1")
         {
-            AgentCombo.SelectedIndex = 3;
+            AgentCombo.SelectedIndex = 0;
         }
         else if (task == "task2")
         {
-            AgentCombo.SelectedIndex = 4;
+            AgentCombo.SelectedIndex = 1;
         }
         else
         {
-            AgentCombo.SelectedIndex = 5;
+            AgentCombo.SelectedIndex = 2;
         }
         UpdateCommandPreview();
     }
@@ -291,7 +286,6 @@ public sealed partial class MainWindow : Window
             ["TASK1_DEBUG_PATH"] = Path.Combine(_projectRoot, "UI", "outputs", "task1", "debug.jsonl"),
             ["TASK2_DEBUG_PATH"] = Path.Combine(_projectRoot, "UI", "outputs", "task2", "debug.jsonl"),
             ["TASK3_DEBUG_PATH"] = Path.Combine(_projectRoot, "UI", "outputs", "task3", "debug.jsonl"),
-            ["NEWAGENTS_DEBUG_PATH"] = Path.Combine(_projectRoot, "UI", "outputs", "newagents", "debug.jsonl"),
         };
 
         if (!string.IsNullOrWhiteSpace(ApiKeyBox.Password))
@@ -304,11 +298,7 @@ public sealed partial class MainWindow : Window
             env["DEEPSEEK_MODEL"] = DeepSeekModelBox.Text.Trim();
         }
 
-        var selectedAgent = SelectedTag(AgentCombo);
-        // BlackPearl Agent 的检索规划与重排需要 Qwen 视觉 API，不能被旧开关误关掉。
-        env["VISION_ENABLED"] = (VisionEnabledBox.IsChecked == true || selectedAgent.StartsWith("blackpearl_", StringComparison.Ordinal))
-            ? "1"
-            : "0";
+        env["VISION_ENABLED"] = VisionEnabledBox.IsChecked == true ? "1" : "0";
         env["QWEN_VL_PROVIDER"] = "dashscope";
         env["QWEN_VL_ENABLE_THINKING"] = "0";
         if (!string.IsNullOrWhiteSpace(QwenApiKeyBox.Password))

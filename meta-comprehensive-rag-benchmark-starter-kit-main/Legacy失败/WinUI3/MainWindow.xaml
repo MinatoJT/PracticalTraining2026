@@ -54,12 +54,9 @@
 
                 <TextBlock Grid.Row="2" Text="Agent" VerticalAlignment="Center" />
                 <ComboBox x:Name="AgentCombo" Grid.Row="2" Grid.Column="1" HorizontalAlignment="Stretch">
-                    <ComboBoxItem Content="Task1KGAgent" Tag="task1kg" />
+                    <ComboBoxItem Content="Task1KGAgent" Tag="task1kg" IsSelected="True" />
                     <ComboBoxItem Content="Task2Agent" Tag="task2agent" />
                     <ComboBoxItem Content="Task3Agent" Tag="task3agent" />
-                    <ComboBoxItem Content="BlackPearl Task1 (Qwen + DeepSeek)" Tag="blackpearl_task1" IsSelected="True" />
-                    <ComboBoxItem Content="BlackPearl Task2 (Qwen + DeepSeek)" Tag="blackpearl_task2" />
-                    <ComboBoxItem Content="BlackPearl Task3 (Qwen + DeepSeek)" Tag="blackpearl_task3" />
                     <ComboBoxItem Content="user_config.UserAgent" Tag="user_config" />
                 </ComboBox>
 

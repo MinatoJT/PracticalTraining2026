@@ -18,8 +18,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(DATASET_DIR / "transformers"))
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(DATASET_DIR / "sentence_transformers"))
 os.environ.setdefault("CRAG_CACHE_DIR", str(DATASET_DIR / "crag_images"))
 os.environ.setdefault("CRAG_WEBSEARCH_CACHE_DIR", str(DATASET_DIR / "crag_web_search"))
-os.environ.setdefault("NEWAGENTS_DEBUG_PATH", str(ROOT_DIR / "UI" / "outputs" / "task1" / "newagents_debug.jsonl"))
-from newagents import Task1KGAgent
+from agents.Task1KGAgent import Task1KGAgent
 from cragmm_search.search import UnifiedSearchPipeline
 
 
@@ -48,18 +47,19 @@ def main():
 
     image = Image.open(image_path).convert("RGB")
     search_pipeline = build_task1_search_pipeline()
-    # 与数据集评测 UI 中的 Task1 默认选项保持一致，使用 Qwen + DeepSeek API 流水线。
     agent = Task1KGAgent(search_pipeline=search_pipeline)
     answer = agent.batch_generate_response([args.question], [image], [[]])[0]
 
     print("\nAnswer:")
     print(answer)
 
-    evidence = agent.inspect_retrieved_evidence(image)
+    raw_results = agent._image_search(image)
+    evidence = agent._build_evidence(raw_results)
     print("\nTop retrieved KG evidence:")
     for idx, item in enumerate(evidence[:3], start=1):
-        preview = item.text[:500]
-        print(f"[{idx}] score={item.retrieval_score:.4f} entity={item.title} {preview}")
+        attrs = item.get("attributes", {})
+        preview = "; ".join(f"{k}: {v}" for k, v in list(attrs.items())[:8])
+        print(f"[{idx}] score={item.get('score')} entity={item.get('entity_name')} {preview}")
 
 
 if __name__ == "__main__":
