@@ -1,0 +1,33 @@
+检查日期：2026-10-03 UTC
+代码提交：870ec0ae954e1035ba34ab30f90e07b1cf158496
+环境：Linux，Python 3.12；通过 GitHub connector 固定提交取得源码
+工作目录：meta-comprehensive-rag-benchmark-starter-kit-main/
+命令：python -m unittest newagents.tests.test_pipeline -v
+安全条件：进程未传入 DEEPSEEK_API_KEY / QWEN_VL_API_KEY / DASHSCOPE_API_KEY
+退出码：1
+状态：模块导入阻塞；18 个业务用例未执行
+说明：源码本地根路径以 <snapshot> 替换；Python 运行时根路径以 <python-runtime> 替换；除此之外保留原始错误。
+
+newagents (unittest.loader._FailedTest.newagents) ... ERROR
+
+======================================================================
+ERROR: newagents (unittest.loader._FailedTest.newagents)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: newagents
+Traceback (most recent call last):
+  File "<python-runtime>/lib/python3.12/unittest/loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "<snapshot>/meta-comprehensive-rag-benchmark-starter-kit-main/newagents/__init__.py", line 3, in <module>
+    from .agents import Task1KGAgent, Task2Agent, Task3Agent
+  File "<snapshot>/meta-comprehensive-rag-benchmark-starter-kit-main/newagents/agents.py", line 7, in <module>
+    from agents.base_agent import BaseAgent
+  File "<snapshot>/meta-comprehensive-rag-benchmark-starter-kit-main/agents/base_agent.py", line 4, in <module>
+    from cragmm_search.search import UnifiedSearchPipeline
+ModuleNotFoundError: No module named 'cragmm_search'
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (errors=1)
